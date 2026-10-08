@@ -1036,6 +1036,228 @@ class SelectLatest:
     def select_latest(self, filename_prefix, filename_postfix):
         assert False, "Not Reachable"
 
+import os
+import io
+import uuid
+import numpy as np
+import torch
+from PIL import Image, ImageOps
+from aiohttp import web
+
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+import folder_paths
+from server import PromptServer
+
+# =====================================================================
+# 1. Server-Side RAM Keypair & Route Registration
+# =====================================================================
+
+# Server RSA Keypair lives strictly in Python RAM
+SERVER_PRIVATE_KEY = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048
+)
+
+SERVER_PUBLIC_KEY_PEM = SERVER_PRIVATE_KEY.public_key().public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
+
+# Registry to store connected Browser Public Keys (keyed by client_id / fallback)
+CLIENT_PUBLIC_KEYS = {}
+LATEST_BROWSER_PUBKEY = None
+
+
+@PromptServer.instance.routes.get("/crypto/server_pubkey")
+async def get_server_pubkey(request):
+    """Exposes Server Public Key to the local browser."""
+    return web.Response(text=SERVER_PUBLIC_KEY_PEM.decode("utf-8"), content_type="text/plain")
+
+
+@PromptServer.instance.routes.post("/crypto/register_browser_key")
+async def register_browser_key(request):
+    """Registers Browser Public Key into server RAM for output encryption."""
+    global LATEST_BROWSER_PUBKEY
+    try:
+        data = await request.json()
+        client_id = data.get("client_id")
+        pubkey_pem = data.get("pubkey")
+
+        pubkey_obj = serialization.load_pem_public_key(pubkey_pem.encode("utf-8"))
+        if client_id:
+            CLIENT_PUBLIC_KEYS[client_id] = pubkey_obj
+        LATEST_BROWSER_PUBKEY = pubkey_obj
+
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+
+# =====================================================================
+# 2. Image Upload RAM Node
+# =====================================================================
+
+class ImageUploadRAM:
+    """
+    Reads an encrypted .bin image file, decrypts in RAM into a mutable bytearray,
+    constructs a PyTorch tensor, and immediately zeroes out decrypted RAM buffers.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if f.endswith(".bin")] if os.path.exists(input_dir) else []
+        return {
+            "required": {
+                "image": (sorted(files),),
+            }
+        }
+
+    CATEGORY = "ram_encryption"
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "load_image_ram"
+
+    def load_image_ram(self, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        with open(image_path, "rb") as f:
+            raw_payload = f.read()
+
+        # Wire Format: [Wrapped AES Key (256B)] + [IV (12B)] + [Ciphertext + Tag]
+        if len(raw_payload) < 268:
+            raise ValueError("Corrupted or invalid encrypted .bin payload length.")
+
+        wrapped_key = raw_payload[:256]
+        iv = raw_payload[256:268]
+        ciphertext = raw_payload[268:]
+
+        # 1. Decrypt Ephemeral AES-GCM Key via Server Private Key
+        aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
+            wrapped_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+
+        # 2. Decrypt Ciphertext directly into mutable bytearray in RAM
+        aesgcm = AESGCM(aes_key_bytes)
+        decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
+
+        # Clear ephemeral key buffer
+        del aes_key_bytes
+
+        try:
+            # 3. Parse image from RAM into PIL and PyTorch Tensor
+            bio = io.BytesIO(decrypted_buf)
+            img = Image.open(bio)
+            img.load()  # Force load pixel data into PIL memory before buffer wiping
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+
+            image_np = np.array(img).astype(np.float32) / 255.0
+            image_tensor = torch.from_numpy(image_np)[None,]  # Shape: [1, H, W, 3]
+        finally:
+            # 4. Immediate Zeroing of Decrypted RAM
+            decrypted_buf[:] = b"\x00" * len(decrypted_buf)
+            del decrypted_buf
+            bio.close()
+
+        return (image_tensor,)
+
+
+# =====================================================================
+# 3. Image Preview RAM Node
+# =====================================================================
+
+class ImagePreviewRAM:
+    """
+    Renders image tensors to PNG in RAM, encrypts using an ephemeral AES-GCM key,
+    wraps the key with the Browser's RSA Public Key, writes the ciphertext .bin
+    to temp disk, and zeroes plaintext RAM immediately.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "browser_pubkey": ("STRING", {"default": "", "multiline": True}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            }
+        }
+
+    CATEGORY = "ram_encryption"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "preview_ram"
+
+    def preview_ram(self, images, browser_pubkey="", prompt=None, extra_pnginfo=None):
+        # Resolve target Browser Public Key
+        target_pubkey = None
+        if browser_pubkey.strip():
+            target_pubkey = serialization.load_pem_public_key(browser_pubkey.strip().encode("utf-8"))
+        elif LATEST_BROWSER_PUBKEY is not None:
+            target_pubkey = LATEST_BROWSER_PUBKEY
+        else:
+            raise RuntimeError("Browser Public Key not registered. Open the ComfyUI UI in a browser.")
+
+        temp_dir = folder_paths.get_temp_directory()
+        output_files = []
+
+        for img_tensor in images:
+            # Convert single image tensor [H, W, 3] to PIL
+            img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
+            img = Image.fromarray(img_np)
+
+            # 1. Render PNG into RAM buffer
+            bio = io.BytesIO()
+            img.save(bio, format="PNG", compress_level=4)
+            plaintext_buf = bytearray(bio.getvalue())
+            bio.close()
+
+            try:
+                # 2. Ephemeral AES-256-GCM Encryption in RAM
+                aes_key = os.urandom(32)
+                iv = os.urandom(12)
+                aesgcm = AESGCM(aes_key)
+                ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
+
+                # 3. Wrap Ephemeral Key with Browser RSA Public Key (RSA-OAEP)
+                wrapped_key = target_pubkey.encrypt(
+                    aes_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+            finally:
+                # 4. Immediate Zeroing of Plaintext PNG RAM
+                plaintext_buf[:] = b"\x00" * len(plaintext_buf)
+                del plaintext_buf
+
+            # 5. Save ONLY Ciphertext to temp disk (.bin)
+            bin_filename = f"{uuid.uuid4().hex}.bin"
+            bin_path = os.path.join(temp_dir, bin_filename)
+            with open(bin_path, "wb") as f:
+                f.write(wrapped_key + iv + ciphertext)
+
+            output_files.append({
+                "filename": bin_filename,
+                "subfolder": "",
+                "type": "temp"
+            })
+
+        # Return standard UI output referencing the .bin files
+        return {"ui": {"bin_images": output_files}}
+    
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,
