@@ -5,14 +5,12 @@ let serverPublicKey = null;
 let browserKeyPair = null;
 let browserPublicKeyPEM = null;
 
-// Helper to convert ArrayBuffer to PEM
 function arrayBufferToPem(buffer, header) {
     const b64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
     const formatted = b64.match(/.{1,64}/g).join("\n");
     return `-----BEGIN ${header}-----\n${formatted}\n-----END ${header}-----`;
 }
 
-// Helper to convert PEM to ArrayBuffer
 function pemToArrayBuffer(pem) {
     const b64 = pem
         .replace(/-----BEGIN [^-]+-----/, "")
@@ -26,18 +24,16 @@ function pemToArrayBuffer(pem) {
     return bytes.buffer;
 }
 
-// Adjust node height according to image aspect ratio to avoid squishing
 function adjustNodeSizeForImage(node, img) {
     const minWidth = Math.max(node.size[0] || 0, 240);
     const aspect = img.naturalWidth / (img.naturalHeight || 1);
     const imgHeight = minWidth / aspect;
     const widgetHeight = node.widgets ? node.widgets.length * 32 : 0;
-    const padding = 60; // Title bar + port margin
+    const padding = 60;
     node.setSize([minWidth, Math.max(120, widgetHeight + imgHeight + padding)]);
     node.setDirtyCanvas(true, true);
 }
 
-// Initialize Browser and Server RSA keys
 async function initCryptoSession() {
     try {
         const res = await fetch("/crypto/server_pubkey");
@@ -80,7 +76,6 @@ async function initCryptoSession() {
     }
 }
 
-// Encrypt File to .bin (WebCrypto AES-GCM + RSA-OAEP Wrap)
 async function encryptFileToBin(file) {
     if (!serverPublicKey) throw new Error("Server Public Key not initialized.");
 
@@ -113,7 +108,6 @@ async function encryptFileToBin(file) {
     return new Blob([combined], { type: "application/octet-stream" });
 }
 
-// Decrypt .bin Buffer to ObjectURL
 async function decryptBinToBlobUrl(binBuffer) {
     if (binBuffer.byteLength < 268) throw new Error("Invalid .bin payload.");
 
@@ -141,7 +135,6 @@ async function decryptBinToBlobUrl(binBuffer) {
     return URL.createObjectURL(blob);
 }
 
-// Register ComfyUI Extension
 app.registerExtension({
     name: "ComfyUI.VHS.RAMEncryption",
 
@@ -149,69 +142,87 @@ app.registerExtension({
         await initCryptoSession();
     },
 
+    // 1. Declare widget schema before VHS.core.js runs its introspection
+    beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === "VHS_ImageUploadRAM") {
+            if (!nodeData.input) nodeData.input = {};
+            if (!nodeData.input.optional) nodeData.input.optional = {};
+            // Register "upload" in nodeData so VHS.core.js recognizes it
+            nodeData.input.optional["upload"] = ["BUTTON", {}];
+        }
+    },
+
     nodeCreated(node) {
         // =============================================================
         // VHS_ImageUploadRAM: Local-Only Preview & Encrypted Upload
         // =============================================================
         if (node.comfyClass === "VHS_ImageUploadRAM") {
-            const uploadBtn = node.addWidget("button", "Upload & Encrypt (.bin)", "upload", () => {
-                const input = document.createElement("input");
-                input.type = "file";
-                input.accept = "image/*";
-                input.style.display = "none";
+            // Guard: avoid duplicate widgets when cloned or dragged from palette
+            if (!node.widgets?.some(w => w.name === "upload")) {
+                const uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = "image/*";
+                    input.style.display = "none";
 
-                input.onchange = async () => {
-                    if (!input.files || input.files.length === 0) return;
-                    const file = input.files[0];
+                    input.onchange = async () => {
+                        if (!input.files || input.files.length === 0) return;
+                        const file = input.files[0];
 
-                    // 1. RENDER LOCALLY: Instant in-memory preview without cloud interaction
-                    const localUrl = URL.createObjectURL(file);
-                    const localImg = new Image();
-                    localImg.onload = () => {
-                        node.imgs = [localImg];
-                        adjustNodeSizeForImage(node, localImg);
-                    };
-                    localImg.src = localUrl;
+                        // 1. RENDER LOCALLY: Instant in-memory preview without cloud interaction
+                        const localUrl = URL.createObjectURL(file);
+                        const localImg = new Image();
+                        localImg.onload = () => {
+                            node.imgs = [localImg];
+                            adjustNodeSizeForImage(node, localImg);
+                        };
+                        localImg.src = localUrl;
 
-                    uploadBtn.name = "Encrypting...";
-                    node.setDirtyCanvas(true);
-
-                    try {
-                        // 2. Encrypt in browser RAM and upload pure ciphertext .bin
-                        const encryptedBlob = await encryptFileToBin(file);
-                        const safeName = `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`;
-
-                        const formData = new FormData();
-                        formData.append("image", encryptedBlob, safeName);
-                        formData.append("overwrite", "true");
-
-                        const resp = await api.fetchApi("/upload/image", {
-                            method: "POST",
-                            body: formData
-                        });
-
-                        if (resp.status === 200) {
-                            const result = await resp.json();
-                            const imageWidget = node.widgets.find(w => w.name === "image");
-                            if (imageWidget) {
-                                if (!imageWidget.options.values.includes(result.name)) {
-                                    imageWidget.options.values.push(result.name);
-                                }
-                                imageWidget.value = result.name;
-                            }
-                        }
-                    } catch (err) {
-                        alert("Encryption upload failed: " + err.message);
-                    } finally {
-                        uploadBtn.name = "Upload & Encrypt (.bin)";
+                        // Mutate label only; KEEP widget.name = "upload" intact
+                        uploadBtn.label = "Encrypting...";
                         node.setDirtyCanvas(true);
-                    }
-                };
 
-                document.body.appendChild(input);
-                input.click();
-                document.body.removeChild(input);
-            });
+                        try {
+                            // 2. Encrypt in browser RAM and upload pure ciphertext .bin
+                            const encryptedBlob = await encryptFileToBin(file);
+                            const safeName = `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`;
+
+                            const formData = new FormData();
+                            formData.append("image", encryptedBlob, safeName);
+                            formData.append("overwrite", "true");
+
+                            const resp = await api.fetchApi("/upload/image", {
+                                method: "POST",
+                                body: formData
+                            });
+
+                            if (resp.status === 200) {
+                                const result = await resp.json();
+                                const imageWidget = node.widgets.find(w => w.name === "image");
+                                if (imageWidget) {
+                                    if (!imageWidget.options.values.includes(result.name)) {
+                                        imageWidget.options.values.push(result.name);
+                                    }
+                                    imageWidget.value = result.name;
+                                }
+                            }
+                        } catch (err) {
+                            alert("Encryption upload failed: " + err.message);
+                        } finally {
+                            uploadBtn.label = "Upload & Encrypt (.bin)";
+                            node.setDirtyCanvas(true);
+                        }
+                    };
+
+                    document.body.appendChild(input);
+                    input.click();
+                    document.body.removeChild(input);
+                });
+
+                // Do not serialize button state into workflow JSON to prevent clone issues
+                uploadBtn.serialize = false;
+                uploadBtn.label = "Upload & Encrypt (.bin)";
+            }
         }
 
         // =============================================================

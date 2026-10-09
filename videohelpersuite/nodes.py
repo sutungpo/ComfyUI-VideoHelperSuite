@@ -1036,8 +1036,10 @@ class SelectLatest:
     def select_latest(self, filename_prefix, filename_postfix):
         assert False, "Not Reachable"
 
+import os
 import io
 import uuid
+import numpy as np
 import torch
 from PIL import Image, ImageOps
 from aiohttp import web
@@ -1053,7 +1055,6 @@ from server import PromptServer
 # 1. Server-Side RAM Key Management
 # =====================================================================
 
-# Server RSA Keypair lives strictly in RAM
 SERVER_PRIVATE_KEY = rsa.generate_private_key(
     public_exponent=65537,
     key_size=2048
@@ -1064,7 +1065,6 @@ SERVER_PUBLIC_KEY_PEM = SERVER_PRIVATE_KEY.public_key().public_bytes(
     format=serialization.PublicFormat.SubjectPublicKeyInfo
 )
 
-# In-memory registry of Browser Public Keys
 LATEST_BROWSER_PUBKEY = None
 CLIENT_PUBLIC_KEYS = {}
 
@@ -1111,7 +1111,9 @@ class VHS_ImageUploadRAM:
         return {
             "required": {
                 "image": (sorted(files),),
-            }
+            },
+            # Explicitly provide optional dictionary to satisfy VHS.core.js introspection
+            "optional": {}
         }
 
     CATEGORY = "Video Helper Suite"
@@ -1119,7 +1121,7 @@ class VHS_ImageUploadRAM:
     RETURN_NAMES = ("IMAGE",)
     FUNCTION = "load_image_ram"
 
-    def load_image_ram(self, image):
+    def load_image_ram(self, image, **kwargs):
         image_path = folder_paths.get_annotated_filepath(image)
         with open(image_path, "rb") as f:
             raw_payload = f.read()
@@ -1178,11 +1180,12 @@ class VHS_ImagePreviewRAM:
     """
     @classmethod
     def INPUT_TYPES(s):
-        # Clean inputs: NO hidden or fake string widgets to prevent visual artifacts
         return {
             "required": {
                 "images": ("IMAGE",),
-            }
+            },
+            # Explicitly provide optional dictionary to satisfy VHS.core.js introspection
+            "optional": {}
         }
 
     CATEGORY = "Video Helper Suite"
@@ -1190,7 +1193,7 @@ class VHS_ImagePreviewRAM:
     OUTPUT_NODE = True
     FUNCTION = "preview_ram"
 
-    def preview_ram(self, images):
+    def preview_ram(self, images, **kwargs):
         if LATEST_BROWSER_PUBKEY is None:
             raise RuntimeError("Browser Public Key not registered. Open the ComfyUI UI in a browser.")
 
@@ -1241,7 +1244,7 @@ class VHS_ImagePreviewRAM:
             })
 
         return {"ui": {"bin_images": output_files}}
-  
+
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,
