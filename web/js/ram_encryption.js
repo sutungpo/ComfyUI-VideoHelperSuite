@@ -137,30 +137,50 @@ app.registerExtension({
                 // --- B. Video Preview (VHS_VideoCombine) ---
                 else if (firstFormat.startsWith("video/")) {
                     const blobUrl = await resolveEncryptedBlobUrl(items[0]);
-
-                    // Target VHS.core.js's built-in "videopreview" widget (uses .videoEl & .parentEl)
                     const vhsWidget = node.widgets?.find(w => w.name === "videopreview");
-                    if (vhsWidget?.videoEl) {
-                        if (vhsWidget.videoEl.src?.startsWith("blob:")) {
-                            URL.revokeObjectURL(vhsWidget.videoEl.src);
-                        }
-                        if (vhsWidget.parentEl) vhsWidget.parentEl.hidden = false;
-                        vhsWidget.videoEl.hidden = false;
-                        if (vhsWidget.imgEl) vhsWidget.imgEl.hidden = true;
+                    const videoEl = vhsWidget?.videoEl || node._fallbackVideoEl;
 
-                        vhsWidget.videoEl.src = blobUrl;
-                        vhsWidget.videoEl.muted = false;
-                        vhsWidget.videoEl.play().catch(() => {
-                            vhsWidget.videoEl.muted = true;
-                            vhsWidget.videoEl.play().catch(() => {});
-                        });
-                    } else if (node._fallbackVideoEl) {
-                        if (node._fallbackVideoEl.src?.startsWith("blob:")) {
-                            URL.revokeObjectURL(node._fallbackVideoEl.src);
+                    if (videoEl) {
+                        if (videoEl.src?.startsWith("blob:")) {
+                            URL.revokeObjectURL(videoEl.src);
                         }
-                        node._fallbackVideoEl.style.display = "block";
-                        node._fallbackVideoEl.src = blobUrl;
-                        node._fallbackVideoEl.play().catch(() => {});
+
+                        // Show element and enable native controls
+                        if (vhsWidget?.parentEl) vhsWidget.parentEl.hidden = false;
+                        videoEl.hidden = false;
+                        videoEl.style.display = "block";
+                        videoEl.controls = true;
+                        videoEl.removeAttribute("controlslist"); // Ensure browser download button is visible
+
+                        // 1. CRITICAL: Stop LiteGraph Canvas from intercepting right-clicks!
+                        // Using capture: true prevents canvas contextmenu events from hijacking "Save Video As..."
+                        const stopContextMenu = (e) => e.stopPropagation();
+                        videoEl.removeEventListener("contextmenu", stopContextMenu, true);
+                        videoEl.addEventListener("contextmenu", stopContextMenu, true);
+
+                        // 2. Load Decrypted Local Blob Video (Audio + Proper FPS)
+                        videoEl.src = blobUrl;
+                        videoEl.muted = false; // Enable audio playback
+                        videoEl.play().catch(() => {
+                            // If browser blocks unmuted autoplay, mute and resume playback
+                            videoEl.muted = true;
+                            videoEl.play().catch(() => {});
+                        });
+
+                        // 3. Add / Update Direct "Download Video" button widget
+                        let dlWidget = node.widgets?.find(w => w.name === "download_video");
+                        if (!dlWidget) {
+                            dlWidget = node.addWidget("button", "download_video", "💾 Download Video", () => {
+                                if (!videoEl.src) return;
+                                const a = document.createElement("a");
+                                a.href = videoEl.src;
+                                a.download = `${items[0].filename.replace(/\.bin$/, "")}.${items[0].format === "video/webm" ? "webm" : "mp4"}`;
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                            });
+                            dlWidget.serialize = false;
+                        }
                     }
                 }
 

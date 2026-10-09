@@ -843,7 +843,12 @@ class VHS_ImagePreviewRAM:
 # 4. VHS_VideoCombine Node (In-Process PyAV + Audio + RAM Encryption)
 # =====================================================================
 
-class VideoCombine:
+class VHS_VideoCombine:
+    """
+    Video Helper Suite - Video Combine (RAM Encryption with Audio & Strict PTS)
+    Encodes video and optional audio entirely in RAM using PyAV, encrypts the container
+    with AES-256-GCM, zeroes plaintext buffers, and outputs ciphertext .bin.
+    """
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -872,7 +877,6 @@ class VideoCombine:
             images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
 
         num_frames, height, width, _ = images.shape
-        # Ensure even dimensions required by yuv420p encoders
         even_h = height - (height % 2)
         even_w = width - (width % 2)
 
@@ -880,16 +884,22 @@ class VideoCombine:
         video_io = io.BytesIO()
         container = av.open(video_io, mode="w", format=container_fmt)
 
-        # 1. Configure Video Stream
+        # -------------------------------------------------------------
+        # 1. Video Stream Configuration (Strict PTS & Timebase)
+        # -------------------------------------------------------------
+        fps_fraction = fractions.Fraction(str(frame_rate)).limit_denominator(1000)
         v_codec = "libvpx-vp9" if container_fmt == "webm" else "h264"
-        v_stream = container.add_stream(v_codec, rate=max(1, int(round(frame_rate))))
+        v_stream = container.add_stream(v_codec, rate=fps_fraction)
         v_stream.width = even_w
         v_stream.height = even_h
         v_stream.pix_fmt = "yuv420p"
+        v_stream.time_base = 1 / fps_fraction  # Ensures correct playback speed
         if v_codec == "h264":
             v_stream.options = {"crf": "20", "preset": "fast"}
 
-        # 2. Configure Optional Audio Stream
+        # -------------------------------------------------------------
+        # 2. Audio Stream Configuration
+        # -------------------------------------------------------------
         a_stream = None
         waveform_np = None
         sample_rate = 44100
@@ -899,69 +909,79 @@ class VideoCombine:
             waveform = audio["waveform"]
             sample_rate = int(audio.get("sample_rate", 44100))
             if waveform.ndim == 3:
-                waveform = waveform[0]  # [channels, samples]
+                waveform = waveform[0]
             waveform_np = waveform.detach().cpu().numpy().astype(np.float32)
 
             channels = waveform_np.shape[0]
-            if channels == 1:
-                layout = "mono"
-            else:
+            layout = "mono" if channels == 1 else "stereo"
+            if channels > 2:
                 waveform_np = waveform_np[:2]
-                layout = "stereo"
+                channels = 2
+
+            # Trim audio length to match video duration
+            video_duration = num_frames / float(frame_rate)
+            max_samples = int(video_duration * sample_rate)
+            waveform_np = waveform_np[:, :max_samples]
 
             a_codec = "libopus" if container_fmt == "webm" else "aac"
             a_stream = container.add_stream(a_codec, rate=sample_rate, layout=layout)
+            a_stream.time_base = fractions.Fraction(1, sample_rate)
 
-        # 3. Encode Video Frames in RAM
-        for img_tensor in images:
+        # -------------------------------------------------------------
+        # 3. Mux Video Frames with Explicit Presentation Timestamps
+        # -------------------------------------------------------------
+        for i, img_tensor in enumerate(images):
             img_np = np.clip(255.0 * img_tensor[:even_h, :even_w, :].detach().cpu().numpy(), 0, 255).astype(np.uint8)
             frame = av.VideoFrame.from_ndarray(img_np, format="rgb24")
+            frame.pts = i  # Explicit PTS ensures frame_rate takes effect
             for packet in v_stream.encode(frame):
                 container.mux(packet)
 
         for packet in v_stream.encode():
             container.mux(packet)
 
-        # 4. Encode Optional Audio Stream in RAM (trimmed to match video length)
-        if a_stream is not None and waveform_np is not None:
-            video_duration = num_frames / float(frame_rate)
-            max_samples = int(video_duration * sample_rate)
-            waveform_np = waveform_np[:, :max_samples]
+        # -------------------------------------------------------------
+        # 4. Mux Audio Frames with Fixed-Block PTS Increments
+        # -------------------------------------------------------------
+        if a_stream is not None and waveform_np is not None and waveform_np.shape[1] > 0:
+            frame_size = a_stream.codec_context.frame_size or 1024
+            total_samples = waveform_np.shape[1]
+            channels = waveform_np.shape[0]
+            audio_pts = 0
 
-            if waveform_np.shape[1] > 0:
-                resampler = av.AudioResampler(
-                    format=a_stream.format,
-                    layout=a_stream.layout,
-                    rate=a_stream.rate,
-                    frame_size=a_stream.codec_context.frame_size or 1024,
-                )
-                a_frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(waveform_np), format="fltp", layout=layout)
+            for start in range(0, total_samples, frame_size):
+                chunk = waveform_np[:, start:start + frame_size]
+                if chunk.shape[1] < frame_size:
+                    padded = np.zeros((channels, frame_size), dtype=np.float32)
+                    padded[:, :chunk.shape[1]] = chunk
+                    chunk = padded
+
+                a_frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(chunk), format="fltp", layout=layout)
                 a_frame.sample_rate = sample_rate
-                a_frame.pts = 0
+                a_frame.time_base = a_stream.time_base
+                a_frame.pts = audio_pts
+                audio_pts += frame_size
 
-                for r_frame in resampler.resample(a_frame):
-                    for packet in a_stream.encode(r_frame):
-                        container.mux(packet)
-                for r_frame in resampler.resample(None):
-                    for packet in a_stream.encode(r_frame):
-                        container.mux(packet)
-                for packet in a_stream.encode():
+                for packet in a_stream.encode(a_frame):
                     container.mux(packet)
+
+            for packet in a_stream.encode():
+                container.mux(packet)
 
         container.close()
 
+        # -------------------------------------------------------------
+        # 5. Encrypt in RAM, Zero Memory & Output Ciphertext
+        # -------------------------------------------------------------
         plaintext_buf = bytearray(video_io.getvalue())
         video_io.close()
 
         try:
-            # 5. Encrypt in RAM
             encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
         finally:
-            # 6. Immediate Zeroing of Plaintext Video RAM
             plaintext_buf[:] = b"\x00" * len(plaintext_buf)
             del plaintext_buf
 
-        # 7. Save Ciphertext .bin
         target_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
         bin_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.bin"
         bin_path = os.path.join(target_dir, bin_filename)
@@ -981,7 +1001,7 @@ class VideoCombine:
         }
 
 NODE_CLASS_MAPPINGS = {
-    "VHS_VideoCombine": VideoCombine,
+    "VHS_VideoCombine": VHS_VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadVideoFFmpeg": LoadVideoFFmpegUpload,
