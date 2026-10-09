@@ -226,7 +226,7 @@ app.registerExtension({
         }
 
         // =============================================================
-        // VHS_ImagePreviewRAM: In-Memory Decrypt & Proportional Render
+        // VHS_ImagePreviewRAM: Zero-Disk Decrypt & Local Render
         // =============================================================
         if (node.comfyClass === "VHS_ImagePreviewRAM") {
             const originalOnExecuted = node.onExecuted;
@@ -235,16 +235,20 @@ app.registerExtension({
                     originalOnExecuted.apply(this, arguments);
                 }
 
-                if (message?.bin_images && message.bin_images.length > 0) {
+                if (message?.ram_ciphertexts && message.ram_ciphertexts.length > 0) {
                     const imgElements = [];
-                    for (const item of message.bin_images) {
-                        const viewUrl = api.apiURL(
-                            `/view?filename=${encodeURIComponent(item.filename)}&type=${item.type}&subfolder=${encodeURIComponent(item.subfolder || "")}`
-                        );
-                        const binResp = await fetch(viewUrl);
-                        const binArray = await binResp.arrayBuffer();
 
-                        const blobUrl = await decryptBinToBlobUrl(binArray);
+                    for (const b64 of message.ram_ciphertexts) {
+                        // Decode Base64 directly into browser RAM
+                        const binaryStr = atob(b64);
+                        const len = binaryStr.length;
+                        const bytes = new Uint8Array(len);
+                        for (let i = 0; i < len; i++) {
+                            bytes[i] = binaryStr.charCodeAt(i);
+                        }
+
+                        // Decrypt in WebCrypto RAM -> Local ObjectURL
+                        const blobUrl = await decryptBinToBlobUrl(bytes.buffer);
                         const img = new Image();
                         img.onload = () => {
                             adjustNodeSizeForImage(node, img);

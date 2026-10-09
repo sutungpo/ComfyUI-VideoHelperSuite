@@ -1036,13 +1036,10 @@ class SelectLatest:
     def select_latest(self, filename_prefix, filename_postfix):
         assert False, "Not Reachable"
 
-import os
 import io
-import uuid
-import numpy as np
-import torch
 from PIL import Image, ImageOps
 from aiohttp import web
+import base64
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -1116,7 +1113,7 @@ class VHS_ImageUploadRAM:
             "optional": {}
         }
 
-    CATEGORY = "Video Helper Suite"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("IMAGE",)
     FUNCTION = "load_image_ram"
@@ -1174,9 +1171,9 @@ class VHS_ImageUploadRAM:
 class VHS_ImagePreviewRAM:
     """
     Video Helper Suite - Image Preview (RAM)
-    Renders image tensors to PNG in RAM, encrypts using an ephemeral AES-GCM key,
-    wraps the key with the Browser's RSA Public Key, writes only the ciphertext .bin
-    to temp disk, and zeroes plaintext RAM immediately.
+    Encodes image tensors in RAM, AES-GCM encrypts, wraps key with Browser RSA Public Key,
+    and returns ciphertext directly via WebSocket UI messages.
+    ZERO bytes (plaintext or ciphertext) touch remote cloud disk.
     """
     @classmethod
     def INPUT_TYPES(s):
@@ -1184,21 +1181,19 @@ class VHS_ImagePreviewRAM:
             "required": {
                 "images": ("IMAGE",),
             },
-            # Explicitly provide optional dictionary to satisfy VHS.core.js introspection
             "optional": {}
         }
 
-    CATEGORY = "Video Helper Suite"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "preview_ram"
 
     def preview_ram(self, images, **kwargs):
         if LATEST_BROWSER_PUBKEY is None:
-            raise RuntimeError("Browser Public Key not registered. Open the ComfyUI UI in a browser.")
+            raise RuntimeError("Browser Public Key not registered. Open ComfyUI in the local browser.")
 
-        temp_dir = folder_paths.get_temp_directory()
-        output_files = []
+        encrypted_payloads = []
 
         for img_tensor in images:
             img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
@@ -1226,24 +1221,18 @@ class VHS_ImagePreviewRAM:
                         label=None
                     )
                 )
+
+                # 4. Pack into in-memory binary: [256B wrapped key] + [12B IV] + [Ciphertext]
+                combined = wrapped_key + iv + ciphertext
+                b64_payload = base64.b64encode(combined).decode("ascii")
+                encrypted_payloads.append(b64_payload)
             finally:
-                # 4. Immediate Zeroing of Plaintext PNG RAM
+                # 5. Immediate zeroing of plaintext RAM
                 plaintext_buf[:] = b"\x00" * len(plaintext_buf)
                 del plaintext_buf
 
-            # 5. Save ONLY Ciphertext to temp disk (.bin)
-            bin_filename = f"{uuid.uuid4().hex}.bin"
-            bin_path = os.path.join(temp_dir, bin_filename)
-            with open(bin_path, "wb") as f:
-                f.write(wrapped_key + iv + ciphertext)
-
-            output_files.append({
-                "filename": bin_filename,
-                "subfolder": "",
-                "type": "temp"
-            })
-
-        return {"ui": {"bin_images": output_files}}
+        # Transmitted purely in RAM over the ComfyUI WebSocket connection
+        return {"ui": {"ram_ciphertexts": encrypted_payloads}}
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
