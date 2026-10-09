@@ -1036,10 +1036,8 @@ class SelectLatest:
     def select_latest(self, filename_prefix, filename_postfix):
         assert False, "Not Reachable"
 
-import os
 import io
 import uuid
-import numpy as np
 import torch
 from PIL import Image, ImageOps
 from aiohttp import web
@@ -1052,10 +1050,10 @@ import folder_paths
 from server import PromptServer
 
 # =====================================================================
-# 1. Server-Side RAM Keypair & Route Registration
+# 1. Server-Side RAM Key Management
 # =====================================================================
 
-# Server RSA Keypair lives strictly in Python RAM
+# Server RSA Keypair lives strictly in RAM
 SERVER_PRIVATE_KEY = rsa.generate_private_key(
     public_exponent=65537,
     key_size=2048
@@ -1066,9 +1064,9 @@ SERVER_PUBLIC_KEY_PEM = SERVER_PRIVATE_KEY.public_key().public_bytes(
     format=serialization.PublicFormat.SubjectPublicKeyInfo
 )
 
-# Registry to store connected Browser Public Keys (keyed by client_id / fallback)
-CLIENT_PUBLIC_KEYS = {}
+# In-memory registry of Browser Public Keys
 LATEST_BROWSER_PUBKEY = None
+CLIENT_PUBLIC_KEYS = {}
 
 
 @PromptServer.instance.routes.get("/crypto/server_pubkey")
@@ -1079,7 +1077,7 @@ async def get_server_pubkey(request):
 
 @PromptServer.instance.routes.post("/crypto/register_browser_key")
 async def register_browser_key(request):
-    """Registers Browser Public Key into server RAM for output encryption."""
+    """Registers Browser Public Key into server RAM."""
     global LATEST_BROWSER_PUBKEY
     try:
         data = await request.json()
@@ -1097,11 +1095,12 @@ async def register_browser_key(request):
 
 
 # =====================================================================
-# 2. Image Upload RAM Node
+# 2. VHS_ImageUploadRAM Node
 # =====================================================================
 
-class ImageUploadRAM:
+class VHS_ImageUploadRAM:
     """
+    Video Helper Suite - Image Upload (RAM)
     Reads an encrypted .bin image file, decrypts in RAM into a mutable bytearray,
     constructs a PyTorch tensor, and immediately zeroes out decrypted RAM buffers.
     """
@@ -1115,8 +1114,9 @@ class ImageUploadRAM:
             }
         }
 
-    CATEGORY = "ram_encryption"
+    CATEGORY = "Video Helper Suite"
     RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("IMAGE",)
     FUNCTION = "load_image_ram"
 
     def load_image_ram(self, image):
@@ -1124,7 +1124,6 @@ class ImageUploadRAM:
         with open(image_path, "rb") as f:
             raw_payload = f.read()
 
-        # Wire Format: [Wrapped AES Key (256B)] + [IV (12B)] + [Ciphertext + Tag]
         if len(raw_payload) < 268:
             raise ValueError("Corrupted or invalid encrypted .bin payload length.")
 
@@ -1132,7 +1131,7 @@ class ImageUploadRAM:
         iv = raw_payload[256:268]
         ciphertext = raw_payload[268:]
 
-        # 1. Decrypt Ephemeral AES-GCM Key via Server Private Key
+        # 1. Decrypt Ephemeral AES Key via Server Private Key
         aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
             wrapped_key,
             padding.OAEP(
@@ -1145,15 +1144,13 @@ class ImageUploadRAM:
         # 2. Decrypt Ciphertext directly into mutable bytearray in RAM
         aesgcm = AESGCM(aes_key_bytes)
         decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
-
-        # Clear ephemeral key buffer
         del aes_key_bytes
 
         try:
-            # 3. Parse image from RAM into PIL and PyTorch Tensor
+            # 3. Parse image from RAM into PyTorch Tensor
             bio = io.BytesIO(decrypted_buf)
             img = Image.open(bio)
-            img.load()  # Force load pixel data into PIL memory before buffer wiping
+            img.load()  # Force load pixel data into PIL memory before zeroing buffer
             img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
 
@@ -1169,50 +1166,38 @@ class ImageUploadRAM:
 
 
 # =====================================================================
-# 3. Image Preview RAM Node
+# 3. VHS_ImagePreviewRAM Node
 # =====================================================================
 
-class ImagePreviewRAM:
+class VHS_ImagePreviewRAM:
     """
+    Video Helper Suite - Image Preview (RAM)
     Renders image tensors to PNG in RAM, encrypts using an ephemeral AES-GCM key,
-    wraps the key with the Browser's RSA Public Key, writes the ciphertext .bin
+    wraps the key with the Browser's RSA Public Key, writes only the ciphertext .bin
     to temp disk, and zeroes plaintext RAM immediately.
     """
     @classmethod
     def INPUT_TYPES(s):
+        # Clean inputs: NO hidden or fake string widgets to prevent visual artifacts
         return {
             "required": {
                 "images": ("IMAGE",),
-            },
-            "optional": {
-                "browser_pubkey": ("STRING", {"default": "", "multiline": True}),
-            },
-            "hidden": {
-                "prompt": "PROMPT",
-                "extra_pnginfo": "EXTRA_PNGINFO",
             }
         }
 
-    CATEGORY = "ram_encryption"
+    CATEGORY = "Video Helper Suite"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "preview_ram"
 
-    def preview_ram(self, images, browser_pubkey="", prompt=None, extra_pnginfo=None):
-        # Resolve target Browser Public Key
-        target_pubkey = None
-        if browser_pubkey.strip():
-            target_pubkey = serialization.load_pem_public_key(browser_pubkey.strip().encode("utf-8"))
-        elif LATEST_BROWSER_PUBKEY is not None:
-            target_pubkey = LATEST_BROWSER_PUBKEY
-        else:
+    def preview_ram(self, images):
+        if LATEST_BROWSER_PUBKEY is None:
             raise RuntimeError("Browser Public Key not registered. Open the ComfyUI UI in a browser.")
 
         temp_dir = folder_paths.get_temp_directory()
         output_files = []
 
         for img_tensor in images:
-            # Convert single image tensor [H, W, 3] to PIL
             img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
             img = Image.fromarray(img_np)
 
@@ -1230,7 +1215,7 @@ class ImagePreviewRAM:
                 ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
 
                 # 3. Wrap Ephemeral Key with Browser RSA Public Key (RSA-OAEP)
-                wrapped_key = target_pubkey.encrypt(
+                wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
                     aes_key,
                     padding.OAEP(
                         mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -1255,9 +1240,8 @@ class ImagePreviewRAM:
                 "type": "temp"
             })
 
-        # Return standard UI output referencing the .bin files
         return {"ui": {"bin_images": output_files}}
-    
+  
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,

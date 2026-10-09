@@ -1,19 +1,18 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// Cryptographic state strictly retained in Browser RAM
 let serverPublicKey = null;
 let browserKeyPair = null;
 let browserPublicKeyPEM = null;
 
-// Convert ArrayBuffer to PEM string
+// Helper to convert ArrayBuffer to PEM
 function arrayBufferToPem(buffer, header) {
     const b64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
     const formatted = b64.match(/.{1,64}/g).join("\n");
     return `-----BEGIN ${header}-----\n${formatted}\n-----END ${header}-----`;
 }
 
-// Convert PEM string to ArrayBuffer
+// Helper to convert PEM to ArrayBuffer
 function pemToArrayBuffer(pem) {
     const b64 = pem
         .replace(/-----BEGIN [^-]+-----/, "")
@@ -27,10 +26,20 @@ function pemToArrayBuffer(pem) {
     return bytes.buffer;
 }
 
+// Adjust node height according to image aspect ratio to avoid squishing
+function adjustNodeSizeForImage(node, img) {
+    const minWidth = Math.max(node.size[0] || 0, 240);
+    const aspect = img.naturalWidth / (img.naturalHeight || 1);
+    const imgHeight = minWidth / aspect;
+    const widgetHeight = node.widgets ? node.widgets.length * 32 : 0;
+    const padding = 60; // Title bar + port margin
+    node.setSize([minWidth, Math.max(120, widgetHeight + imgHeight + padding)]);
+    node.setDirtyCanvas(true, true);
+}
+
 // Initialize Browser and Server RSA keys
 async function initCryptoSession() {
     try {
-        // 1. Fetch Server RSA Public Key
         const res = await fetch("/crypto/server_pubkey");
         const serverPem = await res.text();
         const serverSpki = pemToArrayBuffer(serverPem);
@@ -42,7 +51,6 @@ async function initCryptoSession() {
             ["wrapKey"]
         );
 
-        // 2. Generate Ephemeral Browser RSA-2048 Keypair in Browser RAM
         browserKeyPair = await window.crypto.subtle.generateKey(
             {
                 name: "RSA-OAEP",
@@ -57,7 +65,6 @@ async function initCryptoSession() {
         const exportedSpki = await window.crypto.subtle.exportKey("spki", browserKeyPair.publicKey);
         browserPublicKeyPEM = arrayBufferToPem(exportedSpki, "PUBLIC KEY");
 
-        // 3. Register Browser Public Key with Server
         await fetch("/crypto/register_browser_key", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -67,28 +74,23 @@ async function initCryptoSession() {
             })
         });
 
-        console.log("[RAM Encryption] Session initialized and public keys exchanged.");
+        console.log("[Video Helper Suite - RAM] Crypto session ready.");
     } catch (err) {
-        console.error("[RAM Encryption] Initialization error:", err);
+        console.error("[Video Helper Suite - RAM] Crypto initialization failed:", err);
     }
 }
 
-// Client-side Encrypt File -> .bin Blob
+// Encrypt File to .bin (WebCrypto AES-GCM + RSA-OAEP Wrap)
 async function encryptFileToBin(file) {
-    if (!serverPublicKey) {
-        throw new Error("Server Public Key not loaded yet.");
-    }
+    if (!serverPublicKey) throw new Error("Server Public Key not initialized.");
 
     const fileBuffer = await file.arrayBuffer();
-
-    // 1. Generate Ephemeral AES-256-GCM Key
     const aesKey = await window.crypto.subtle.generateKey(
         { name: "AES-GCM", length: 256 },
         true,
         ["encrypt"]
     );
 
-    // 2. Encrypt File Content
     const iv = window.crypto.getRandomValues(new Uint8Array(12));
     const ciphertext = await window.crypto.subtle.encrypt(
         { name: "AES-GCM", iv: iv },
@@ -96,7 +98,6 @@ async function encryptFileToBin(file) {
         fileBuffer
     );
 
-    // 3. Wrap Ephemeral AES Key with Server RSA Public Key (RSA-OAEP)
     const wrappedKey = await window.crypto.subtle.wrapKey(
         "raw",
         aesKey,
@@ -104,7 +105,6 @@ async function encryptFileToBin(file) {
         { name: "RSA-OAEP" }
     );
 
-    // 4. Concatenate: [Wrapped Key (256B)] + [IV (12B)] + [Ciphertext + Tag]
     const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
     combined.set(new Uint8Array(wrappedKey), 0);
     combined.set(iv, 256);
@@ -113,17 +113,14 @@ async function encryptFileToBin(file) {
     return new Blob([combined], { type: "application/octet-stream" });
 }
 
-// Client-side Decrypt .bin ArrayBuffer -> Plaintext Image ObjectURL
+// Decrypt .bin Buffer to ObjectURL
 async function decryptBinToBlobUrl(binBuffer) {
-    if (binBuffer.byteLength < 268) {
-        throw new Error("Invalid .bin payload received.");
-    }
+    if (binBuffer.byteLength < 268) throw new Error("Invalid .bin payload.");
 
     const wrappedKey = binBuffer.slice(0, 256);
     const iv = binBuffer.slice(256, 268);
     const ciphertext = binBuffer.slice(268);
 
-    // 1. Unwrap AES Key with Browser RSA Private Key
     const aesKey = await window.crypto.subtle.unwrapKey(
         "raw",
         wrappedKey,
@@ -134,7 +131,6 @@ async function decryptBinToBlobUrl(binBuffer) {
         ["decrypt"]
     );
 
-    // 2. Decrypt Content
     const decryptedBytes = await window.crypto.subtle.decrypt(
         { name: "AES-GCM", iv: new Uint8Array(iv) },
         aesKey,
@@ -147,7 +143,7 @@ async function decryptBinToBlobUrl(binBuffer) {
 
 // Register ComfyUI Extension
 app.registerExtension({
-    name: "ComfyUI.RAMEncryption",
+    name: "ComfyUI.VHS.RAMEncryption",
 
     async setup() {
         await initCryptoSession();
@@ -155,9 +151,9 @@ app.registerExtension({
 
     nodeCreated(node) {
         // =============================================================
-        // Hook: ImageUploadRAM Node UI
+        // VHS_ImageUploadRAM: Local-Only Preview & Encrypted Upload
         // =============================================================
-        if (node.comfyClass === "ImageUploadRAM") {
+        if (node.comfyClass === "VHS_ImageUploadRAM") {
             const uploadBtn = node.addWidget("button", "Upload & Encrypt (.bin)", "upload", () => {
                 const input = document.createElement("input");
                 input.type = "file";
@@ -167,10 +163,21 @@ app.registerExtension({
                 input.onchange = async () => {
                     if (!input.files || input.files.length === 0) return;
                     const file = input.files[0];
+
+                    // 1. RENDER LOCALLY: Instant in-memory preview without cloud interaction
+                    const localUrl = URL.createObjectURL(file);
+                    const localImg = new Image();
+                    localImg.onload = () => {
+                        node.imgs = [localImg];
+                        adjustNodeSizeForImage(node, localImg);
+                    };
+                    localImg.src = localUrl;
+
                     uploadBtn.name = "Encrypting...";
                     node.setDirtyCanvas(true);
 
                     try {
+                        // 2. Encrypt in browser RAM and upload pure ciphertext .bin
                         const encryptedBlob = await encryptFileToBin(file);
                         const safeName = `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`;
 
@@ -208,16 +215,9 @@ app.registerExtension({
         }
 
         // =============================================================
-        // Hook: ImagePreviewRAM Node UI
+        // VHS_ImagePreviewRAM: In-Memory Decrypt & Proportional Render
         // =============================================================
-        if (node.comfyClass === "ImagePreviewRAM") {
-            // Automatically supply Browser Public Key widget value if present
-            const pubWidget = node.widgets?.find(w => w.name === "browser_pubkey");
-            if (pubWidget) {
-                pubWidget.type = "hidden"; // Hide raw PEM text from workspace
-            }
-
-            // Override onExecuted to fetch and decrypt ciphertext .bin files
+        if (node.comfyClass === "VHS_ImagePreviewRAM") {
             const originalOnExecuted = node.onExecuted;
             node.onExecuted = async function (message) {
                 if (originalOnExecuted) {
@@ -235,6 +235,9 @@ app.registerExtension({
 
                         const blobUrl = await decryptBinToBlobUrl(binArray);
                         const img = new Image();
+                        img.onload = () => {
+                            adjustNodeSizeForImage(node, img);
+                        };
                         img.src = blobUrl;
                         imgElements.push(img);
                     }
@@ -243,17 +246,6 @@ app.registerExtension({
                     app.graph.setDirtyCanvas(true);
                 }
             };
-        }
-    },
-
-    // Inject Browser Public Key into prompt submission
-    async beforeQueuedPrompt(prompt) {
-        if (!browserPublicKeyPEM) return;
-        for (const nodeId in prompt.output) {
-            const nodeData = prompt.output[nodeId];
-            if (nodeData.class_type === "ImagePreviewRAM" && nodeData.inputs) {
-                nodeData.inputs["browser_pubkey"] = browserPublicKeyPEM;
-            }
         }
     }
 });
