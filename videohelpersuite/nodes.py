@@ -243,20 +243,13 @@ def to_pingpong(inp):
         yield inp[i]
 
 import uuid
-import shutil
-import threading
-try:
-    import imageio_ffmpeg
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception:
-    FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
+import struct
 class VideoCombine:
     """
-    Video Helper Suite - Video Combine (RAM)
-    Pipes raw frames directly into an FFmpeg process in RAM, captures encoded
-    video from stdout pipe, AES-GCM encrypts in RAM, wraps key with Browser RSA
-    Public Key, and zeroes plaintext video buffers immediately.
-    ZERO plaintext touches remote cloud disk or preview routes.
+    Video Helper Suite - Video Combine (Solution 1: Client-Side Assembly)
+    The remote cloud server NEVER creates or sees any video file.
+    Frames are packed and AES-GCM encrypted in RAM, and plaintext RAM is wiped.
+    Video compilation is offloaded 100% to the local browser's hardware encoder.
     """
     @classmethod
     def INPUT_TYPES(s):
@@ -278,86 +271,47 @@ class VideoCombine:
     CATEGORY = "Video Helper Suite"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
-    FUNCTION = "combine_video_ram"
+    FUNCTION = "combine_video_client"
 
-    def combine_video_ram(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
-                          format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
+    def combine_video_client(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
+                             format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
+        # Access the global public key initialized in nodes.py
+        from .nodes import LATEST_BROWSER_PUBKEY
         if LATEST_BROWSER_PUBKEY is None:
             raise RuntimeError("Browser Public Key not registered. Open ComfyUI in the local browser.")
 
-        # 1. Handle Pingpong frame sequencing
+        # 1. Frame sequencing (Pingpong)
         if pingpong and len(images) > 2:
             images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
 
         num_frames, height, width, _ = images.shape
 
-        # 2. Setup In-Memory FFmpeg Pipe Command
-        # Notice: -movflags frag_keyframe+empty_moov+default_base_moof allows fragmented MP4 streaming via stdout pipe
-        cmd = [
-            FFMPEG_PATH,
-            "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", f"{width}x{height}",
-            "-r", str(frame_rate),
-            "-i", "pipe:0",
-        ]
+        # 2. Pack frames into an in-memory binary format:
+        # Header: [num_frames (uint32)] + [width (uint32)] + [height (uint32)]
+        # Per frame: [frame_byte_len (uint32)] + [WebP bytes]
+        packed_buf = bytearray()
+        packed_buf.extend(struct.pack("<III", num_frames, width, height))
 
-        if format == "video/mp4":
-            cmd += [
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-preset", "fast",
-                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                "-f", "mp4",
-                "pipe:1"
-            ]
-        else:  # video/webm
-            cmd += [
-                "-c:v", "libvpx-vp9",
-                "-pix_fmt", "yuv420p",
-                "-f", "webm",
-                "pipe:1"
-            ]
+        for img_tensor in images:
+            img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
+            img = Image.fromarray(img_np)
 
-        # 3. Spawn FFmpeg process with stdin/stdout pipes
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
+            bio = io.BytesIO()
+            img.save(bio, format="WEBP", quality=90, method=4)
+            frame_bytes = bio.getvalue()
+            bio.close()
 
-        # 4. Stream raw frames into stdin pipe in a background thread to prevent buffer deadlock
-        def pipe_frame_feeder():
-            try:
-                for frame in images:
-                    frame_np = (frame.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-                    proc.stdin.write(frame_np.tobytes())
-                proc.stdin.close()
-            except Exception:
-                pass
-
-        feeder_thread = threading.Thread(target=pipe_frame_feeder)
-        feeder_thread.start()
-
-        # Capture encoded container bytes directly from stdout pipe in RAM
-        stdout_bytes, _ = proc.communicate()
-        feeder_thread.join()
-
-        if proc.returncode != 0 or not stdout_bytes:
-            raise RuntimeError("FFmpeg in-memory encoding failed.")
-
-        # 5. Encrypt in RAM and Immediately Zero Plaintext Buffer
-        plaintext_buf = bytearray(stdout_bytes)
-        del stdout_bytes
+            packed_buf.extend(struct.pack("<I", len(frame_bytes)))
+            packed_buf.extend(frame_bytes)
 
         try:
+            # 3. Ephemeral AES-256-GCM Encryption in RAM
             aes_key = os.urandom(32)
             iv = os.urandom(12)
             aesgcm = AESGCM(aes_key)
-            ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
+            ciphertext = aesgcm.encrypt(iv, bytes(packed_buf), None)
 
+            # 4. Wrap Key with Browser RSA Public Key
             wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
                 aes_key,
                 padding.OAEP(
@@ -367,11 +321,11 @@ class VideoCombine:
                 )
             )
         finally:
-            # Immediate zeroing of plaintext video RAM buffer
-            plaintext_buf[:] = b"\x00" * len(plaintext_buf)
-            del plaintext_buf
+            # 5. Immediate Zeroing of in-memory packed frames
+            packed_buf[:] = b"\x00" * len(packed_buf)
+            del packed_buf
 
-        # 6. Save Pure Ciphertext .bin to Disk
+        # 6. Save Pure Ciphertext to temp disk (.bin)
         target_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
         bin_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.bin"
         bin_path = os.path.join(target_dir, bin_filename)
@@ -381,10 +335,11 @@ class VideoCombine:
 
         return {
             "ui": {
-                "bin_videos": [{
+                "client_video_frames": [{
                     "filename": bin_filename,
                     "subfolder": "",
                     "type": "output" if save_output else "temp",
+                    "fps": frame_rate,
                     "format": format
                 }]
             }

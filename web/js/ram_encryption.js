@@ -253,28 +253,102 @@ app.registerExtension({
             };
         }
 
+        // VHS_VideoCombine: Client-Side Web Assembly & Hardware Encoding
         // =============================================================
-        // 3. VHS_VideoCombine: In-Memory Decrypt & Interactive Video Player
-        // =============================================================
-        if (node.comfyClass === "VHS_VideoCombine") {
+        if (node.comfyClass === "VideoCombine") {
             const originalOnExecuted = node.onExecuted;
             node.onExecuted = async function (message) {
                 if (originalOnExecuted) {
                     originalOnExecuted.apply(this, arguments);
                 }
 
-                if (message?.bin_videos && message.bin_videos.length > 0) {
-                    for (const item of message.bin_videos) {
+                if (message?.client_video_frames && message.client_video_frames.length > 0) {
+                    for (const item of message.client_video_frames) {
+                        // 1. Fetch Ciphertext .bin
                         const viewUrl = api.apiURL(
                             `/view?filename=${encodeURIComponent(item.filename)}&type=${item.type}&subfolder=${encodeURIComponent(item.subfolder || "")}`
                         );
                         const binResp = await fetch(viewUrl);
                         const binArray = await binResp.arrayBuffer();
 
-                        // Decrypt in WebCrypto RAM -> Local ObjectURL
-                        const videoBlobUrl = await decryptBinToBlobUrl(binArray, item.format || "video/mp4");
+                        // 2. Decrypt in WebCrypto RAM
+                        const wrappedKey = binArray.slice(0, 256);
+                        const iv = binArray.slice(256, 268);
+                        const ciphertext = binArray.slice(268);
 
-                        // Find or attach HTML5 video player widget
+                        const aesKey = await window.crypto.subtle.unwrapKey(
+                            "raw",
+                            wrappedKey,
+                            browserKeyPair.privateKey,
+                            { name: "RSA-OAEP" },
+                            { name: "AES-GCM", length: 256 },
+                            false,
+                            ["decrypt"]
+                        );
+
+                        const decryptedBytes = await window.crypto.subtle.decrypt(
+                            { name: "AES-GCM", iv: new Uint8Array(iv) },
+                            aesKey,
+                            ciphertext
+                        );
+
+                        // 3. Unpack Frames from Decrypted RAM Buffer
+                        const view = new DataView(decryptedBytes);
+                        const numFrames = view.getUint32(0, true);
+                        const width = view.getUint32(4, true);
+                        const height = view.getUint32(8, true);
+
+                        let offset = 12;
+                        const bitmaps = [];
+                        for (let i = 0; i < numFrames; i++) {
+                            const frameLen = view.getUint32(offset, true);
+                            offset += 4;
+                            const frameBlob = new Blob([decryptedBytes.slice(offset, offset + frameLen)], { type: "image/webp" });
+                            offset += frameLen;
+                            const bmp = await createImageBitmap(frameBlob);
+                            bitmaps.push(bmp);
+                        }
+
+                        // 4. Assemble Video Container Locally via Canvas + Native Hardware Encoder
+                        const canvas = document.createElement("canvas");
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext("2d");
+
+                        const stream = canvas.captureStream(0);
+                        const track = stream.getVideoTracks()[0];
+
+                        // Target MP4 if supported locally, otherwise fallback to WebM
+                        const mimeType = (item.format === "video/mp4" && MediaRecorder.isTypeSupported("video/mp4;codecs=avc1"))
+                            ? "video/mp4;codecs=avc1"
+                            : (MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9" : "video/webm");
+
+                        const recorder = new MediaRecorder(stream, { mimeType });
+                        const chunks = [];
+                        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+                        const encodingPromise = new Promise((resolve) => {
+                            recorder.onstop = () => {
+                                const videoBlob = new Blob(chunks, { type: mimeType });
+                                resolve(URL.createObjectURL(videoBlob));
+                            };
+                        });
+
+                        recorder.start();
+
+                        // Render frame-by-frame into encoder
+                        const frameDelay = 1000 / item.fps;
+                        for (const bmp of bitmaps) {
+                            ctx.drawImage(bmp, 0, 0);
+                            if (track.requestFrame) track.requestFrame();
+                            await new Promise((r) => setTimeout(r, frameDelay));
+                            bmp.close(); // Immediate GPU memory cleanup
+                        }
+
+                        recorder.stop();
+                        const localVideoUrl = await encodingPromise;
+
+                        // 5. Mount into interactive local <video> player widget
                         let videoWidget = node.widgets?.find(w => w.name === "ram_video_player");
                         if (!videoWidget) {
                             const videoEl = document.createElement("video");
@@ -301,7 +375,7 @@ app.registerExtension({
                             if (videoEl.src && videoEl.src.startsWith("blob:")) {
                                 URL.revokeObjectURL(videoEl.src);
                             }
-                            videoEl.src = videoBlobUrl;
+                            videoEl.src = localVideoUrl;
                             videoEl.play().catch(() => {});
                         }
                     }
