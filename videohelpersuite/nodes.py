@@ -243,13 +243,12 @@ def to_pingpong(inp):
         yield inp[i]
 
 import uuid
-import struct
-class VideoCombine:
+import av
+class VHS_VideoCombine:
     """
-    Video Helper Suite - Video Combine (Solution 1: Client-Side Assembly)
-    The remote cloud server NEVER creates or sees any video file.
-    Frames are packed and AES-GCM encrypted in RAM, and plaintext RAM is wiped.
-    Video compilation is offloaded 100% to the local browser's hardware encoder.
+    Video Helper Suite - Video Combine (RAM Encryption)
+    Encodes MP4 entirely in-memory using in-process PyAV (zero subprocess leaks),
+    encrypts the MP4 buffer in RAM, zeroes plaintext memory, and saves ciphertext .bin.
     """
     @classmethod
     def INPUT_TYPES(s):
@@ -259,59 +258,60 @@ class VideoCombine:
                 "frame_rate": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 120.0, "step": 1.0}),
                 "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "filename_prefix": ("STRING", {"default": "RAM_Video"}),
-                "format": (["video/mp4", "video/webm"],),
+                "format": (["video/mp4"],),
                 "pingpong": ("BOOLEAN", {"default": False}),
                 "save_output": ("BOOLEAN", {"default": False}),
             },
-            "optional": {
-                "audio": ("AUDIO",),
-            }
+            "optional": {}
         }
 
     CATEGORY = "Video Helper Suite"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
-    FUNCTION = "combine_video_client"
+    FUNCTION = "combine_video"
 
-    def combine_video_client(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
-                             format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
-        # Access the global public key initialized in nodes.py
+    def combine_video(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
+                      format="video/mp4", pingpong=False, save_output=False, **kwargs):
         from .nodes import LATEST_BROWSER_PUBKEY
         if LATEST_BROWSER_PUBKEY is None:
-            raise RuntimeError("Browser Public Key not registered. Open ComfyUI in the local browser.")
+            raise RuntimeError("Browser Public Key not registered. Refresh the ComfyUI browser tab.")
 
-        # 1. Frame sequencing (Pingpong)
         if pingpong and len(images) > 2:
+            import torch
             images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
 
         num_frames, height, width, _ = images.shape
 
-        # 2. Pack frames into an in-memory binary format:
-        # Header: [num_frames (uint32)] + [width (uint32)] + [height (uint32)]
-        # Per frame: [frame_byte_len (uint32)] + [WebP bytes]
-        packed_buf = bytearray()
-        packed_buf.extend(struct.pack("<III", num_frames, width, height))
+        # 1. Encode MP4 in RAM using in-process PyAV (No subprocess, No OS pipes)
+        mp4_io = io.BytesIO()
+        container = av.open(mp4_io, mode="w", format="mp4")
+        stream = container.add_stream("h264", rate=int(frame_rate))
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "20", "preset": "fast"}
 
         for img_tensor in images:
             img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
-            img = Image.fromarray(img_np)
+            frame = av.VideoFrame.from_ndarray(img_np, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
 
-            bio = io.BytesIO()
-            img.save(bio, format="WEBP", quality=90, method=4)
-            frame_bytes = bio.getvalue()
-            bio.close()
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
 
-            packed_buf.extend(struct.pack("<I", len(frame_bytes)))
-            packed_buf.extend(frame_bytes)
+        plaintext_buf = bytearray(mp4_io.getvalue())
+        mp4_io.close()
 
         try:
-            # 3. Ephemeral AES-256-GCM Encryption in RAM
+            # 2. Ephemeral AES-256-GCM Encryption in RAM
             aes_key = os.urandom(32)
             iv = os.urandom(12)
             aesgcm = AESGCM(aes_key)
-            ciphertext = aesgcm.encrypt(iv, bytes(packed_buf), None)
+            ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
 
-            # 4. Wrap Key with Browser RSA Public Key
+            # 3. Wrap Key with Browser RSA Public Key (RSA-OAEP)
             wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
                 aes_key,
                 padding.OAEP(
@@ -321,11 +321,11 @@ class VideoCombine:
                 )
             )
         finally:
-            # 5. Immediate Zeroing of in-memory packed frames
-            packed_buf[:] = b"\x00" * len(packed_buf)
-            del packed_buf
+            # 4. Immediate Zeroing of Plaintext Video in RAM
+            plaintext_buf[:] = b"\x00" * len(plaintext_buf)
+            del plaintext_buf
 
-        # 6. Save Pure Ciphertext to temp disk (.bin)
+        # 5. Save Pure Ciphertext .bin to Disk
         target_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
         bin_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.bin"
         bin_path = os.path.join(target_dir, bin_filename)
@@ -333,14 +333,14 @@ class VideoCombine:
         with open(bin_path, "wb") as f:
             f.write(wrapped_key + iv + ciphertext)
 
+        # Return standard VHS format contract
         return {
             "ui": {
-                "client_video_frames": [{
+                "gifs": [{
                     "filename": bin_filename,
                     "subfolder": "",
                     "type": "output" if save_output else "temp",
-                    "fps": frame_rate,
-                    "format": format
+                    "format": "video/mp4"
                 }]
             }
         }
