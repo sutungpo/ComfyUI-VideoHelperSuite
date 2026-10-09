@@ -134,61 +134,6 @@ app.registerExtension({
                     }
                 }
 
-                // --- B. Video Preview (VHS_VideoCombine) ---
-                else if (firstFormat.startsWith("video/")) {
-                    const blobUrl = await resolveEncryptedBlobUrl(items[0]);
-                    const vhsWidget = node.widgets?.find(w => w.name === "videopreview");
-                    const videoEl = vhsWidget?.videoEl || node._fallbackVideoEl;
-
-                    if (videoEl) {
-                        if (videoEl.src?.startsWith("blob:")) {
-                            URL.revokeObjectURL(videoEl.src);
-                        }
-
-                        // Show player
-                        if (vhsWidget?.parentEl) vhsWidget.parentEl.hidden = false;
-                        videoEl.hidden = false;
-                        videoEl.style.display = "block";
-                        videoEl.controls = true;
-                        videoEl.style.pointerEvents = "auto";
-                        videoEl.removeAttribute("controlslist");
-
-                        // 1. Restore Native Right-Click (Stops LiteGraph from hijacking contextmenu)
-                        const stopContextMenu = (e) => e.stopPropagation();
-                        videoEl.removeEventListener("contextmenu", stopContextMenu, true);
-                        videoEl.addEventListener("contextmenu", stopContextMenu, true);
-                        if (vhsWidget?.parentEl) {
-                            vhsWidget.parentEl.removeEventListener("contextmenu", stopContextMenu, true);
-                            vhsWidget.parentEl.addEventListener("contextmenu", stopContextMenu, true);
-                        }
-
-                        // 2. Play with Audio enabled
-                        videoEl.src = blobUrl;
-                        videoEl.muted = false;
-                        videoEl.play().catch(() => {
-                            // Fallback for browsers that block unmuted autoplay
-                            videoEl.muted = true;
-                            videoEl.play().catch(() => {});
-                        });
-
-                        // 3. Add / Update Direct "Save Video" button widget onto the node
-                        let dlWidget = node.widgets?.find(w => w.name === "save_video_ram");
-                        if (!dlWidget) {
-                            dlWidget = node.addWidget("button", "save_video_ram", "💾 Save Video (.mp4)", () => {
-                                if (!videoEl.src) return;
-                                const ext = items[0].format === "video/webm" ? "webm" : "mp4";
-                                const a = document.createElement("a");
-                                a.href = videoEl.src;
-                                a.download = `${items[0].filename.replace(/\.bin$/, "")}.${ext}`;
-                                document.body.appendChild(a);
-                                a.click();
-                                document.body.removeChild(a);
-                            });
-                            dlWidget.serialize = false;
-                        }
-                    }
-                }
-
                 app.graph.setDirtyCanvas(true, true);
             } catch (err) {
                 console.error("[RAM Encryption] Preview decryption error:", err);
@@ -205,25 +150,6 @@ app.registerExtension({
     },
 
     nodeCreated(node) {
-        // Fallback video widget if VHS.core.js did not attach "videopreview"
-        if (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine") {
-            setTimeout(() => {
-                if (!node.widgets?.some(w => w.name === "videopreview") && !node._fallbackVideoEl) {
-                    const videoEl = document.createElement("video");
-                    videoEl.controls = true;
-                    videoEl.autoplay = true;
-                    videoEl.loop = true;
-                    videoEl.style.width = "100%";
-                    videoEl.style.display = "none";
-                    videoEl.onloadedmetadata = () => resizeNodeForMedia(node, videoEl.videoWidth, videoEl.videoHeight);
-
-                    const domWidget = node.addDOMWidget("ram_video_fallback", "video", videoEl, { serialize: false });
-                    domWidget.serialize = false;
-                    node._fallbackVideoEl = videoEl;
-                }
-            }, 0);
-        }
-
         // Upload & Encrypt button for VHS_ImageUploadRAM
         if (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM") {
             if (!node.widgets?.some(w => w.name === "upload")) {
