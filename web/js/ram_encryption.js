@@ -142,7 +142,7 @@ app.registerExtension({
     },
 
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name === "VHS_ImageUploadRAM") {
+        if (nodeData.name === "VHS_ImageUploadRAM" || nodeData.name === "VHS_LoadVideo") {
             if (!nodeData.input) nodeData.input = {};
             if (!nodeData.input.optional) nodeData.input.optional = {};
             nodeData.input.optional["upload"] = ["BUTTON", {}];
@@ -150,65 +150,57 @@ app.registerExtension({
     },
 
     nodeCreated(node) {
-        // Upload & Encrypt button for VHS_ImageUploadRAM
-        if (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM") {
-            if (!node.widgets?.some(w => w.name === "upload")) {
-                const uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {
-                    const input = document.createElement("input");
-                    input.type = "file";
-                    input.accept = "image/*";
-                    input.onchange = async () => {
-                        if (!input.files?.length) return;
-                        const file = input.files[0];
+        const isTarget = ["VHS_ImageUploadRAM", "VHS_LoadVideo"].includes(node.comfyClass || node.type);
+        if (isTarget && !node.widgets?.some(w => w.name === "upload_encrypted")) {
+            const isVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
+            const uploadBtn = node.addWidget("button", "upload_encrypted", "Upload & Encrypt Video (.bin)", () => {
+                const input = document.createElement("input");
+                input.type = "file";
+                input.accept = isVideo ? "video/*" : "image/*";
 
-                        // Instant local-only preview
-                        const img = new Image();
-                        img.onload = () => {
-                            node.imgs = [img];
-                            resizeNodeForMedia(node, img.naturalWidth, img.naturalHeight);
-                        };
-                        img.src = URL.createObjectURL(file);
+                input.onchange = async () => {
+                    if (!input.files?.length) return;
+                    const file = input.files[0];
 
-                        uploadBtn.label = "Encrypting...";
-                        node.setDirtyCanvas(true);
+                    uploadBtn.label = "Encrypting & Uploading...";
+                    node.setDirtyCanvas(true);
 
-                        try {
-                            const fileBuf = await file.arrayBuffer();
-                            const aesKey = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
-                            const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                            const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuf);
-                            const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, serverPublicKey, { name: "RSA-OAEP" });
+                    try {
+                        const fileBuf = await file.arrayBuffer();
+                        const aesKey = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+                        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                        const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuf);
+                        const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, serverPublicKey, { name: "RSA-OAEP" });
 
-                            const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
-                            combined.set(new Uint8Array(wrappedKey), 0);
-                            combined.set(iv, 256);
-                            combined.set(new Uint8Array(ciphertext), 268);
+                        const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
+                        combined.set(new Uint8Array(wrappedKey), 0);
+                        combined.set(iv, 256);
+                        combined.set(new Uint8Array(ciphertext), 268);
 
-                            const formData = new FormData();
-                            formData.append("image", new Blob([combined]), `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`);
-                            formData.append("overwrite", "true");
+                        const formData = new FormData();
+                        formData.append("image", new Blob([combined]), `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`);
+                        formData.append("overwrite", "true");
 
-                            const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
-                            if (res.status === 200) {
-                                const data = await res.json();
-                                const widget = node.widgets.find(w => w.name === "image");
-                                if (widget) {
-                                    if (!widget.options.values.includes(data.name)) widget.options.values.push(data.name);
-                                    widget.value = data.name;
-                                }
+                        const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
+                        if (res.status === 200) {
+                            const data = await res.json();
+                            const widget = node.widgets.find(w => w.name === "video" || w.name === "image");
+                            if (widget) {
+                                if (!widget.options.values.includes(data.name)) widget.options.values.push(data.name);
+                                widget.value = data.name;
+                                widget.callback?.(data.name);
                             }
-                        } catch (err) {
-                            alert("Encryption upload failed: " + err.message);
-                        } finally {
-                            uploadBtn.label = "Upload & Encrypt (.bin)";
-                            node.setDirtyCanvas(true);
                         }
-                    };
-                    input.click();
-                });
-                uploadBtn.serialize = false;
-                uploadBtn.label = "Upload & Encrypt (.bin)";
-            }
+                    } catch (err) {
+                        alert("Video encryption upload failed: " + err.message);
+                    } finally {
+                        uploadBtn.label = "Upload & Encrypt Video (.bin)";
+                        node.setDirtyCanvas(true);
+                    }
+                };
+                input.click();
+            });
+            uploadBtn.serialize = false;
         }
     }
 });
