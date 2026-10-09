@@ -242,14 +242,7 @@ def to_pingpong(inp):
     for i in range(len(inp)-2,0,-1):
         yield inp[i]
 
-import uuid
-import av
 class VideoCombine:
-    """
-    Video Helper Suite - Video Combine (RAM Encryption)
-    Encodes MP4 entirely in-memory using in-process PyAV (zero subprocess leaks),
-    encrypts the MP4 buffer in RAM, zeroes plaintext memory, and saves ciphertext .bin.
-    """
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -258,11 +251,13 @@ class VideoCombine:
                 "frame_rate": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 120.0, "step": 1.0}),
                 "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "filename_prefix": ("STRING", {"default": "RAM_Video"}),
-                "format": (["video/mp4"],),
+                "format": (["video/mp4", "video/webm"],),
                 "pingpong": ("BOOLEAN", {"default": False}),
                 "save_output": ("BOOLEAN", {"default": False}),
             },
-            "optional": {}
+            "optional": {
+                "audio": ("AUDIO",),
+            }
         }
 
     CATEGORY = "Video Helper Suite"
@@ -271,76 +266,115 @@ class VideoCombine:
     FUNCTION = "combine_video"
 
     def combine_video(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
-                      format="video/mp4", pingpong=False, save_output=False, **kwargs):
-        from .nodes import LATEST_BROWSER_PUBKEY
-        if LATEST_BROWSER_PUBKEY is None:
-            raise RuntimeError("Browser Public Key not registered. Refresh the ComfyUI browser tab.")
-
+                      format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
         if pingpong and len(images) > 2:
-            import torch
             images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
 
         num_frames, height, width, _ = images.shape
+        # Ensure even dimensions required by yuv420p encoders
+        even_h = height - (height % 2)
+        even_w = width - (width % 2)
 
-        # 1. Encode MP4 in RAM using in-process PyAV (No subprocess, No OS pipes)
-        mp4_io = io.BytesIO()
-        container = av.open(mp4_io, mode="w", format="mp4")
-        stream = container.add_stream("h264", rate=int(frame_rate))
-        stream.width = width
-        stream.height = height
-        stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": "20", "preset": "fast"}
+        container_fmt = "webm" if format == "video/webm" else "mp4"
+        video_io = io.BytesIO()
+        container = av.open(video_io, mode="w", format=container_fmt)
 
+        # 1. Configure Video Stream
+        v_codec = "libvpx-vp9" if container_fmt == "webm" else "h264"
+        v_stream = container.add_stream(v_codec, rate=max(1, int(round(frame_rate))))
+        v_stream.width = even_w
+        v_stream.height = even_h
+        v_stream.pix_fmt = "yuv420p"
+        if v_codec == "h264":
+            v_stream.options = {"crf": "20", "preset": "fast"}
+
+        # 2. Configure Optional Audio Stream
+        a_stream = None
+        waveform_np = None
+        sample_rate = 44100
+        layout = "stereo"
+
+        if audio is not None and isinstance(audio, dict) and "waveform" in audio:
+            waveform = audio["waveform"]
+            sample_rate = int(audio.get("sample_rate", 44100))
+            if waveform.ndim == 3:
+                waveform = waveform[0]  # [channels, samples]
+            waveform_np = waveform.detach().cpu().numpy().astype(np.float32)
+
+            channels = waveform_np.shape[0]
+            if channels == 1:
+                layout = "mono"
+            else:
+                waveform_np = waveform_np[:2]
+                layout = "stereo"
+
+            a_codec = "libopus" if container_fmt == "webm" else "aac"
+            a_stream = container.add_stream(a_codec, rate=sample_rate, layout=layout)
+
+        # 3. Encode Video Frames in RAM
         for img_tensor in images:
-            img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
+            img_np = np.clip(255.0 * img_tensor[:even_h, :even_w, :].detach().cpu().numpy(), 0, 255).astype(np.uint8)
             frame = av.VideoFrame.from_ndarray(img_np, format="rgb24")
-            for packet in stream.encode(frame):
+            for packet in v_stream.encode(frame):
                 container.mux(packet)
 
-        for packet in stream.encode():
+        for packet in v_stream.encode():
             container.mux(packet)
+
+        # 4. Encode Optional Audio Stream in RAM (trimmed to match video length)
+        if a_stream is not None and waveform_np is not None:
+            video_duration = num_frames / float(frame_rate)
+            max_samples = int(video_duration * sample_rate)
+            waveform_np = waveform_np[:, :max_samples]
+
+            if waveform_np.shape[1] > 0:
+                resampler = av.AudioResampler(
+                    format=a_stream.format,
+                    layout=a_stream.layout,
+                    rate=a_stream.rate,
+                    frame_size=a_stream.codec_context.frame_size or 1024,
+                )
+                a_frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(waveform_np), format="fltp", layout=layout)
+                a_frame.sample_rate = sample_rate
+                a_frame.pts = 0
+
+                for r_frame in resampler.resample(a_frame):
+                    for packet in a_stream.encode(r_frame):
+                        container.mux(packet)
+                for r_frame in resampler.resample(None):
+                    for packet in a_stream.encode(r_frame):
+                        container.mux(packet)
+                for packet in a_stream.encode():
+                    container.mux(packet)
+
         container.close()
 
-        plaintext_buf = bytearray(mp4_io.getvalue())
-        mp4_io.close()
+        plaintext_buf = bytearray(video_io.getvalue())
+        video_io.close()
 
         try:
-            # 2. Ephemeral AES-256-GCM Encryption in RAM
-            aes_key = os.urandom(32)
-            iv = os.urandom(12)
-            aesgcm = AESGCM(aes_key)
-            ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
-
-            # 3. Wrap Key with Browser RSA Public Key (RSA-OAEP)
-            wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
-                aes_key,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
-            )
+            # 5. Encrypt in RAM
+            encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
         finally:
-            # 4. Immediate Zeroing of Plaintext Video in RAM
+            # 6. Immediate Zeroing of Plaintext Video RAM
             plaintext_buf[:] = b"\x00" * len(plaintext_buf)
             del plaintext_buf
 
-        # 5. Save Pure Ciphertext .bin to Disk
+        # 7. Save Ciphertext .bin
         target_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
         bin_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.bin"
         bin_path = os.path.join(target_dir, bin_filename)
 
         with open(bin_path, "wb") as f:
-            f.write(wrapped_key + iv + ciphertext)
+            f.write(encrypted_payload)
 
-        # Return standard VHS format contract
         return {
             "ui": {
-                "gifs": [{
+                "ram_preview": [{
                     "filename": bin_filename,
                     "subfolder": "",
                     "type": "output" if save_output else "temp",
-                    "format": "video/mp4"
+                    "format": format
                 }]
             }
         }
@@ -748,10 +782,14 @@ class SelectLatest:
     def select_latest(self, filename_prefix, filename_postfix):
         assert False, "Not Reachable"
 
+import os
 import io
+import uuid
+import numpy as np
+import torch
+import av
 from PIL import Image, ImageOps
 from aiohttp import web
-import base64
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -780,13 +818,11 @@ CLIENT_PUBLIC_KEYS = {}
 
 @PromptServer.instance.routes.get("/crypto/server_pubkey")
 async def get_server_pubkey(request):
-    """Exposes Server Public Key to the local browser."""
     return web.Response(text=SERVER_PUBLIC_KEY_PEM.decode("utf-8"), content_type="text/plain")
 
 
 @PromptServer.instance.routes.post("/crypto/register_browser_key")
 async def register_browser_key(request):
-    """Registers Browser Public Key into server RAM."""
     global LATEST_BROWSER_PUBKEY
     try:
         data = await request.json()
@@ -803,16 +839,32 @@ async def register_browser_key(request):
         return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 
+def encrypt_buffer_for_browser(plaintext_buf: bytearray) -> bytes:
+    """Encrypts a mutable bytearray in RAM and wraps the ephemeral AES key with the Browser Public Key."""
+    if LATEST_BROWSER_PUBKEY is None:
+        raise RuntimeError("Browser Public Key not registered. Please refresh the ComfyUI browser tab.")
+
+    aes_key = os.urandom(32)
+    iv = os.urandom(12)
+    aesgcm = AESGCM(aes_key)
+    ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
+
+    wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return wrapped_key + iv + ciphertext
+
+
 # =====================================================================
 # 2. VHS_ImageUploadRAM Node
 # =====================================================================
 
 class VHS_ImageUploadRAM:
-    """
-    Video Helper Suite - Image Upload (RAM)
-    Reads an encrypted .bin image file, decrypts in RAM into a mutable bytearray,
-    constructs a PyTorch tensor, and immediately zeroes out decrypted RAM buffers.
-    """
     @classmethod
     def INPUT_TYPES(s):
         input_dir = folder_paths.get_input_directory()
@@ -821,11 +873,10 @@ class VHS_ImageUploadRAM:
             "required": {
                 "image": (sorted(files),),
             },
-            # Explicitly provide optional dictionary to satisfy VHS.core.js introspection
             "optional": {}
         }
 
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    CATEGORY = "Video Helper Suite"
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("IMAGE",)
     FUNCTION = "load_image_ram"
@@ -836,13 +887,12 @@ class VHS_ImageUploadRAM:
             raw_payload = f.read()
 
         if len(raw_payload) < 268:
-            raise ValueError("Corrupted or invalid encrypted .bin payload length.")
+            raise ValueError("Corrupted or invalid encrypted .bin payload.")
 
         wrapped_key = raw_payload[:256]
         iv = raw_payload[256:268]
         ciphertext = raw_payload[268:]
 
-        # 1. Decrypt Ephemeral AES Key via Server Private Key
         aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
             wrapped_key,
             padding.OAEP(
@@ -852,23 +902,20 @@ class VHS_ImageUploadRAM:
             )
         )
 
-        # 2. Decrypt Ciphertext directly into mutable bytearray in RAM
         aesgcm = AESGCM(aes_key_bytes)
         decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
         del aes_key_bytes
 
         try:
-            # 3. Parse image from RAM into PyTorch Tensor
             bio = io.BytesIO(decrypted_buf)
             img = Image.open(bio)
-            img.load()  # Force load pixel data into PIL memory before zeroing buffer
+            img.load()
             img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
 
             image_np = np.array(img).astype(np.float32) / 255.0
-            image_tensor = torch.from_numpy(image_np)[None,]  # Shape: [1, H, W, 3]
+            image_tensor = torch.from_numpy(image_np)[None,]
         finally:
-            # 4. Immediate Zeroing of Decrypted RAM
             decrypted_buf[:] = b"\x00" * len(decrypted_buf)
             del decrypted_buf
             bio.close()
@@ -881,12 +928,6 @@ class VHS_ImageUploadRAM:
 # =====================================================================
 
 class VHS_ImagePreviewRAM:
-    """
-    Video Helper Suite - Image Preview (RAM)
-    Encodes image tensors in RAM, AES-GCM encrypts, wraps key with Browser RSA Public Key,
-    and returns ciphertext directly via WebSocket UI messages.
-    ZERO bytes (plaintext or ciphertext) touch remote cloud disk.
-    """
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -896,55 +937,43 @@ class VHS_ImagePreviewRAM:
             "optional": {}
         }
 
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    CATEGORY = "Video Helper Suite"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "preview_ram"
 
     def preview_ram(self, images, **kwargs):
-        if LATEST_BROWSER_PUBKEY is None:
-            raise RuntimeError("Browser Public Key not registered. Open ComfyUI in the local browser.")
-
-        encrypted_payloads = []
+        temp_dir = folder_paths.get_temp_directory()
+        output_files = []
 
         for img_tensor in images:
-            img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
+            img_np = np.clip(255.0 * img_tensor.detach().cpu().numpy(), 0, 255).astype(np.uint8)
             img = Image.fromarray(img_np)
 
-            # 1. Render PNG into RAM buffer
             bio = io.BytesIO()
             img.save(bio, format="PNG", compress_level=4)
             plaintext_buf = bytearray(bio.getvalue())
             bio.close()
 
             try:
-                # 2. Ephemeral AES-256-GCM Encryption in RAM
-                aes_key = os.urandom(32)
-                iv = os.urandom(12)
-                aesgcm = AESGCM(aes_key)
-                ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
-
-                # 3. Wrap Ephemeral Key with Browser RSA Public Key (RSA-OAEP)
-                wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
-                    aes_key,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None
-                    )
-                )
-
-                # 4. Pack into in-memory binary: [256B wrapped key] + [12B IV] + [Ciphertext]
-                combined = wrapped_key + iv + ciphertext
-                b64_payload = base64.b64encode(combined).decode("ascii")
-                encrypted_payloads.append(b64_payload)
+                encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
             finally:
-                # 5. Immediate zeroing of plaintext RAM
                 plaintext_buf[:] = b"\x00" * len(plaintext_buf)
                 del plaintext_buf
 
-        # Transmitted purely in RAM over the ComfyUI WebSocket connection
-        return {"ui": {"ram_ciphertexts": encrypted_payloads}}
+            bin_filename = f"{uuid.uuid4().hex}.bin"
+            bin_path = os.path.join(temp_dir, bin_filename)
+            with open(bin_path, "wb") as f:
+                f.write(encrypted_payload)
+
+            output_files.append({
+                "filename": bin_filename,
+                "subfolder": "",
+                "type": "temp",
+                "format": "image/png"
+            })
+
+        return {"ui": {"ram_preview": output_files}}
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
