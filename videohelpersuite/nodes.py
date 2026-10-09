@@ -250,7 +250,7 @@ try:
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
-class VHS_VideoCombine:
+class VideoCombine:
     """
     Video Helper Suite - Video Combine (RAM)
     Pipes raw frames directly into an FFmpeg process in RAM, captures encoded
