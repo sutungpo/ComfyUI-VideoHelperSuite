@@ -24,13 +24,13 @@ function pemToArrayBuffer(pem) {
     return bytes.buffer;
 }
 
-function adjustNodeSizeForImage(node, img) {
-    const minWidth = Math.max(node.size[0] || 0, 240);
-    const aspect = img.naturalWidth / (img.naturalHeight || 1);
-    const imgHeight = minWidth / aspect;
-    const widgetHeight = node.widgets ? node.widgets.length * 32 : 0;
-    const padding = 60;
-    node.setSize([minWidth, Math.max(120, widgetHeight + imgHeight + padding)]);
+function adjustNodeSizeForMedia(node, mediaWidth, mediaHeight) {
+    const minWidth = Math.max(node.size[0] || 0, 320);
+    const aspect = mediaWidth / (mediaHeight || 1);
+    const calculatedHeight = minWidth / aspect;
+    const widgetHeight = node.widgets ? node.widgets.length * 30 : 0;
+    const padding = 70;
+    node.setSize([minWidth, Math.max(140, widgetHeight + calculatedHeight + padding)]);
     node.setDirtyCanvas(true, true);
 }
 
@@ -108,7 +108,7 @@ async function encryptFileToBin(file) {
     return new Blob([combined], { type: "application/octet-stream" });
 }
 
-async function decryptBinToBlobUrl(binBuffer) {
+async function decryptBinToBlobUrl(binBuffer, mimeType = "image/png") {
     if (binBuffer.byteLength < 268) throw new Error("Invalid .bin payload.");
 
     const wrappedKey = binBuffer.slice(0, 256);
@@ -131,7 +131,7 @@ async function decryptBinToBlobUrl(binBuffer) {
         ciphertext
     );
 
-    const blob = new Blob([decryptedBytes], { type: "image/png" });
+    const blob = new Blob([decryptedBytes], { type: mimeType });
     return URL.createObjectURL(blob);
 }
 
@@ -142,22 +142,19 @@ app.registerExtension({
         await initCryptoSession();
     },
 
-    // 1. Declare widget schema before VHS.core.js runs its introspection
     beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === "VHS_ImageUploadRAM") {
             if (!nodeData.input) nodeData.input = {};
             if (!nodeData.input.optional) nodeData.input.optional = {};
-            // Register "upload" in nodeData so VHS.core.js recognizes it
             nodeData.input.optional["upload"] = ["BUTTON", {}];
         }
     },
 
     nodeCreated(node) {
         // =============================================================
-        // VHS_ImageUploadRAM: Local-Only Preview & Encrypted Upload
+        // 1. VHS_ImageUploadRAM: Local Preview & Encrypted Upload
         // =============================================================
         if (node.comfyClass === "VHS_ImageUploadRAM") {
-            // Guard: avoid duplicate widgets when cloned or dragged from palette
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {
                     const input = document.createElement("input");
@@ -169,21 +166,19 @@ app.registerExtension({
                         if (!input.files || input.files.length === 0) return;
                         const file = input.files[0];
 
-                        // 1. RENDER LOCALLY: Instant in-memory preview without cloud interaction
+                        // RENDER LOCALLY: Instant in-memory preview without cloud interaction
                         const localUrl = URL.createObjectURL(file);
                         const localImg = new Image();
                         localImg.onload = () => {
                             node.imgs = [localImg];
-                            adjustNodeSizeForImage(node, localImg);
+                            adjustNodeSizeForMedia(node, localImg.naturalWidth, localImg.naturalHeight);
                         };
                         localImg.src = localUrl;
 
-                        // Mutate label only; KEEP widget.name = "upload" intact
                         uploadBtn.label = "Encrypting...";
                         node.setDirtyCanvas(true);
 
                         try {
-                            // 2. Encrypt in browser RAM and upload pure ciphertext .bin
                             const encryptedBlob = await encryptFileToBin(file);
                             const safeName = `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`;
 
@@ -219,14 +214,13 @@ app.registerExtension({
                     document.body.removeChild(input);
                 });
 
-                // Do not serialize button state into workflow JSON to prevent clone issues
                 uploadBtn.serialize = false;
                 uploadBtn.label = "Upload & Encrypt (.bin)";
             }
         }
 
         // =============================================================
-        // VHS_ImagePreviewRAM: Zero-Disk Decrypt & Local Render
+        // 2. VHS_ImagePreviewRAM: In-Memory Decrypt & Proportional Render
         // =============================================================
         if (node.comfyClass === "VHS_ImagePreviewRAM") {
             const originalOnExecuted = node.onExecuted;
@@ -235,29 +229,82 @@ app.registerExtension({
                     originalOnExecuted.apply(this, arguments);
                 }
 
-                if (message?.ram_ciphertexts && message.ram_ciphertexts.length > 0) {
+                if (message?.bin_images && message.bin_images.length > 0) {
                     const imgElements = [];
+                    for (const item of message.bin_images) {
+                        const viewUrl = api.apiURL(
+                            `/view?filename=${encodeURIComponent(item.filename)}&type=${item.type}&subfolder=${encodeURIComponent(item.subfolder || "")}`
+                        );
+                        const binResp = await fetch(viewUrl);
+                        const binArray = await binResp.arrayBuffer();
 
-                    for (const b64 of message.ram_ciphertexts) {
-                        // Decode Base64 directly into browser RAM
-                        const binaryStr = atob(b64);
-                        const len = binaryStr.length;
-                        const bytes = new Uint8Array(len);
-                        for (let i = 0; i < len; i++) {
-                            bytes[i] = binaryStr.charCodeAt(i);
-                        }
-
-                        // Decrypt in WebCrypto RAM -> Local ObjectURL
-                        const blobUrl = await decryptBinToBlobUrl(bytes.buffer);
+                        const blobUrl = await decryptBinToBlobUrl(binArray, "image/png");
                         const img = new Image();
                         img.onload = () => {
-                            adjustNodeSizeForImage(node, img);
+                            adjustNodeSizeForMedia(node, img.naturalWidth, img.naturalHeight);
                         };
                         img.src = blobUrl;
                         imgElements.push(img);
                     }
 
                     node.imgs = imgElements;
+                    app.graph.setDirtyCanvas(true);
+                }
+            };
+        }
+
+        // =============================================================
+        // 3. VHS_VideoCombine: In-Memory Decrypt & Interactive Video Player
+        // =============================================================
+        if (node.comfyClass === "VHS_VideoCombine") {
+            const originalOnExecuted = node.onExecuted;
+            node.onExecuted = async function (message) {
+                if (originalOnExecuted) {
+                    originalOnExecuted.apply(this, arguments);
+                }
+
+                if (message?.bin_videos && message.bin_videos.length > 0) {
+                    for (const item of message.bin_videos) {
+                        const viewUrl = api.apiURL(
+                            `/view?filename=${encodeURIComponent(item.filename)}&type=${item.type}&subfolder=${encodeURIComponent(item.subfolder || "")}`
+                        );
+                        const binResp = await fetch(viewUrl);
+                        const binArray = await binResp.arrayBuffer();
+
+                        // Decrypt in WebCrypto RAM -> Local ObjectURL
+                        const videoBlobUrl = await decryptBinToBlobUrl(binArray, item.format || "video/mp4");
+
+                        // Find or attach HTML5 video player widget
+                        let videoWidget = node.widgets?.find(w => w.name === "ram_video_player");
+                        if (!videoWidget) {
+                            const videoEl = document.createElement("video");
+                            videoEl.controls = true;
+                            videoEl.autoplay = true;
+                            videoEl.loop = true;
+                            videoEl.muted = true;
+                            videoEl.style.width = "100%";
+                            videoEl.style.borderRadius = "4px";
+
+                            videoEl.onloadedmetadata = () => {
+                                adjustNodeSizeForMedia(node, videoEl.videoWidth || 320, videoEl.videoHeight || 240);
+                            };
+
+                            videoWidget = node.addDOMWidget("ram_video_player", "video", videoEl, {
+                                getValue: () => videoEl.src,
+                                setValue: (v) => { videoEl.src = v; }
+                            });
+                            videoWidget.serialize = false;
+                        }
+
+                        const videoEl = videoWidget.element;
+                        if (videoEl) {
+                            if (videoEl.src && videoEl.src.startsWith("blob:")) {
+                                URL.revokeObjectURL(videoEl.src);
+                            }
+                            videoEl.src = videoBlobUrl;
+                            videoEl.play().catch(() => {});
+                        }
+                    }
                     app.graph.setDirtyCanvas(true);
                 }
             };
