@@ -244,7 +244,7 @@ def to_pingpong(inp):
 
 import uuid
 import av
-class VHS_VideoCombine:
+class VideoCombine:
     """
     Video Helper Suite - Video Combine (RAM Encryption)
     Encodes MP4 entirely in-memory using in-process PyAV (zero subprocess leaks),
