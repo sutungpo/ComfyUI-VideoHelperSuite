@@ -145,36 +145,40 @@ app.registerExtension({
                             URL.revokeObjectURL(videoEl.src);
                         }
 
-                        // Show element and enable native controls
+                        // Show player
                         if (vhsWidget?.parentEl) vhsWidget.parentEl.hidden = false;
                         videoEl.hidden = false;
                         videoEl.style.display = "block";
                         videoEl.controls = true;
-                        videoEl.removeAttribute("controlslist"); // Ensure browser download button is visible
+                        videoEl.style.pointerEvents = "auto";
+                        videoEl.removeAttribute("controlslist");
 
-                        // 1. CRITICAL: Stop LiteGraph Canvas from intercepting right-clicks!
-                        // Using capture: true prevents canvas contextmenu events from hijacking "Save Video As..."
+                        // 1. Restore Native Right-Click (Stops LiteGraph from hijacking contextmenu)
                         const stopContextMenu = (e) => e.stopPropagation();
                         videoEl.removeEventListener("contextmenu", stopContextMenu, true);
                         videoEl.addEventListener("contextmenu", stopContextMenu, true);
+                        if (vhsWidget?.parentEl) {
+                            vhsWidget.parentEl.removeEventListener("contextmenu", stopContextMenu, true);
+                            vhsWidget.parentEl.addEventListener("contextmenu", stopContextMenu, true);
+                        }
 
-                        // 2. Load Decrypted Local Blob Video (Audio + Proper FPS)
+                        // 2. Play with Audio enabled
                         videoEl.src = blobUrl;
-                        videoEl.muted = false; // Enable audio playback
+                        videoEl.muted = false;
                         videoEl.play().catch(() => {
-                            // If browser blocks unmuted autoplay, mute and resume playback
                             videoEl.muted = true;
                             videoEl.play().catch(() => {});
                         });
 
-                        // 3. Add / Update Direct "Download Video" button widget
-                        let dlWidget = node.widgets?.find(w => w.name === "download_video");
+                        // 3. Add Direct "Save Video" button widget onto the node
+                        let dlWidget = node.widgets?.find(w => w.name === "save_video_ram");
                         if (!dlWidget) {
-                            dlWidget = node.addWidget("button", "download_video", "💾 Download Video", () => {
+                            dlWidget = node.addWidget("button", "save_video_ram", "💾 Save Video (.mp4)", () => {
                                 if (!videoEl.src) return;
+                                const ext = items[0].format === "video/webm" ? "webm" : "mp4";
                                 const a = document.createElement("a");
                                 a.href = videoEl.src;
-                                a.download = `${items[0].filename.replace(/\.bin$/, "")}.${items[0].format === "video/webm" ? "webm" : "mp4"}`;
+                                a.download = `${items[0].filename.replace(/\.bin$/, "")}.${ext}`;
                                 document.body.appendChild(a);
                                 a.click();
                                 document.body.removeChild(a);
