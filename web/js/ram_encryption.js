@@ -5,8 +5,10 @@ let serverPublicKey = null;
 let browserKeyPair = null;
 let browserPublicKeyPEM = null;
 
+const decryptionCache = new Map();
+
 // =====================================================================
-// 1. Core WebCrypto & Sizing Helpers
+// WebCrypto Handshake Setup
 // =====================================================================
 
 function pemToArrayBuffer(pem) {
@@ -19,13 +21,17 @@ function arrayBufferToPem(buffer, header) {
     return `-----BEGIN ${header}-----\n${b64.match(/.{1,64}/g).join("\n")}\n-----END ${header}-----`;
 }
 
-function resizeNodeForMedia(node, mediaWidth, mediaHeight) {
-    const minWidth = Math.max(node.size[0] || 0, 260);
-    const aspect = (mediaWidth || 1) / (mediaHeight || 1);
-    const mediaDisplayHeight = minWidth / aspect;
-    const widgetHeight = node.widgets ? node.widgets.length * 28 : 0;
-    node.setSize([minWidth, Math.max(140, widgetHeight + mediaDisplayHeight + 60)]);
-    app.graph.setDirtyCanvas(true, true);
+async function registerKey() {
+    if (!browserPublicKeyPEM) return;
+    try {
+        await fetch("/crypto/register_browser_key", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ client_id: api.clientId, pubkey: browserPublicKeyPEM })
+        });
+    } catch (e) {
+        console.error("[RAM Encryption] Key registration failed:", e);
+    }
 }
 
 async function initCryptoSession() {
@@ -48,54 +54,90 @@ async function initCryptoSession() {
         const exportedSpki = await window.crypto.subtle.exportKey("spki", browserKeyPair.publicKey);
         browserPublicKeyPEM = arrayBufferToPem(exportedSpki, "PUBLIC KEY");
 
-        await fetch("/crypto/register_browser_key", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ client_id: api.clientId, pubkey: browserPublicKeyPEM })
-        });
-
-        console.log("[RAM Encryption] Session ready.");
+        await registerKey();
+        console.log("[RAM Encryption] Crypto session ready.");
     } catch (err) {
         console.error("[RAM Encryption] Setup failed:", err);
     }
 }
 
 // =====================================================================
-// 2. Unified Decryption Helper (Images & Videos)
+// Transparent Interceptor Proxy (Reuses 100% of Comfy & VHS UI Code)
 // =====================================================================
 
-async function resolveEncryptedBlobUrl(item) {
-    const viewUrl = api.apiURL(
-        `/view?filename=${encodeURIComponent(item.filename)}&type=${item.type}&subfolder=${encodeURIComponent(item.subfolder || "")}`
-    );
-    const binResp = await fetch(viewUrl);
-    const buf = await binResp.arrayBuffer();
+async function decryptUrlToBlobUrl(url, mimeType) {
+    if (decryptionCache.has(url)) return decryptionCache.get(url);
 
-    if (buf.byteLength < 268) {
-        throw new Error("Invalid encrypted .bin payload size.");
-    }
+    const promise = (async () => {
+        try {
+            const res = await fetch(url);
+            const buf = await res.arrayBuffer();
 
-    const aesKey = await window.crypto.subtle.unwrapKey(
-        "raw",
-        buf.slice(0, 256),
-        browserKeyPair.privateKey,
-        { name: "RSA-OAEP" },
-        { name: "AES-GCM", length: 256 },
-        false,
-        ["decrypt"]
-    );
+            // Format: [256B wrapped key] + [12B IV] + [Ciphertext + Tag]
+            const aesKey = await window.crypto.subtle.unwrapKey(
+                "raw",
+                buf.slice(0, 256),
+                browserKeyPair.privateKey,
+                { name: "RSA-OAEP" },
+                { name: "AES-GCM", length: 256 },
+                false,
+                ["decrypt"]
+            );
 
-    const decrypted = await window.crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: new Uint8Array(buf.slice(256, 268)) },
-        aesKey,
-        buf.slice(268)
-    );
+            const decrypted = await window.crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: new Uint8Array(buf.slice(256, 268)) },
+                aesKey,
+                buf.slice(268)
+            );
 
-    return URL.createObjectURL(new Blob([decrypted], { type: item.format || "application/octet-stream" }));
+            return URL.createObjectURL(new Blob([decrypted], { type: mimeType }));
+        } catch (err) {
+            console.error("[RAM Decryption] Error decrypting media:", url, err);
+            return url;
+        }
+    })();
+
+    decryptionCache.set(url, promise);
+    return promise;
 }
 
+// Transparent Image Property Interceptor
+const originalImageSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+Object.defineProperty(HTMLImageElement.prototype, "src", {
+    set: function (val) {
+        if (typeof val === "string" && val.includes("/view?") && val.includes(".bin")) {
+            decryptUrlToBlobUrl(val, "image/png").then(blobUrl => {
+                originalImageSrc.set.call(this, blobUrl);
+            });
+        } else {
+            originalImageSrc.set.call(this, val);
+        }
+    },
+    get: function () {
+        return originalImageSrc.get.call(this);
+    }
+});
+
+// Transparent Media (HTML5 Video) Property Interceptor
+const originalMediaSrc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "src");
+Object.defineProperty(HTMLMediaElement.prototype, "src", {
+    set: function (val) {
+        if (typeof val === "string" && val.includes("/view?") && val.includes(".bin")) {
+            const mime = val.includes("webm") ? "video/webm" : "video/mp4";
+            decryptUrlToBlobUrl(val, mime).then(blobUrl => {
+                originalMediaSrc.set.call(this, blobUrl);
+            });
+        } else {
+            originalMediaSrc.set.call(this, val);
+        }
+    },
+    get: function () {
+        return originalMediaSrc.get.call(this);
+    }
+});
+
 // =====================================================================
-// 3. Extension Registration & Unified Preview Dispatcher
+// Extension Registration
 // =====================================================================
 
 app.registerExtension({
@@ -103,104 +145,18 @@ app.registerExtension({
 
     async setup() {
         await initCryptoSession();
-
-        // Unified Handler for both VHS_ImagePreviewRAM and VHS_VideoCombine
-        api.addEventListener("executed", async ({ detail }) => {
-            const items = detail?.output?.ram_preview;
-            if (!items || !items.length) return;
-
-            const node = app.graph.getNodeById(detail.node);
-            if (!node) return;
-
-            try {
-                const firstFormat = items[0].format || "";
-
-                // --- A. Image Preview (VHS_ImagePreviewRAM) ---
-                if (firstFormat.startsWith("image/")) {
-                    const loadedImgs = [];
-                    for (const item of items) {
-                        const blobUrl = await resolveEncryptedBlobUrl(item);
-                        const img = new Image();
-                        await new Promise((resolve) => {
-                            img.onload = resolve;
-                            img.onerror = resolve;
-                            img.src = blobUrl;
-                        });
-                        loadedImgs.push(img);
-                    }
-                    node.imgs = loadedImgs;
-                    if (loadedImgs[0]?.naturalWidth) {
-                        resizeNodeForMedia(node, loadedImgs[0].naturalWidth, loadedImgs[0].naturalHeight);
-                    }
-                }
-
-                // --- B. Video Preview (VHS_VideoCombine) ---
-                else if (firstFormat.startsWith("video/")) {
-                    const blobUrl = await resolveEncryptedBlobUrl(items[0]);
-
-                    // Target VHS.core.js's built-in "videopreview" widget (uses .videoEl & .parentEl)
-                    const vhsWidget = node.widgets?.find(w => w.name === "videopreview");
-                    if (vhsWidget?.videoEl) {
-                        if (vhsWidget.videoEl.src?.startsWith("blob:")) {
-                            URL.revokeObjectURL(vhsWidget.videoEl.src);
-                        }
-                        if (vhsWidget.parentEl) vhsWidget.parentEl.hidden = false;
-                        vhsWidget.videoEl.hidden = false;
-                        if (vhsWidget.imgEl) vhsWidget.imgEl.hidden = true;
-
-                        vhsWidget.videoEl.src = blobUrl;
-                        vhsWidget.videoEl.muted = false;
-                        vhsWidget.videoEl.play().catch(() => {
-                            vhsWidget.videoEl.muted = true;
-                            vhsWidget.videoEl.play().catch(() => {});
-                        });
-                    } else if (node._fallbackVideoEl) {
-                        if (node._fallbackVideoEl.src?.startsWith("blob:")) {
-                            URL.revokeObjectURL(node._fallbackVideoEl.src);
-                        }
-                        node._fallbackVideoEl.style.display = "block";
-                        node._fallbackVideoEl.src = blobUrl;
-                        node._fallbackVideoEl.play().catch(() => {});
-                    }
-                }
-
-                app.graph.setDirtyCanvas(true, true);
-            } catch (err) {
-                console.error("[RAM Encryption] Preview decryption error:", err);
-            }
-        });
+        api.addEventListener("open", registerKey); // Re-register key on websocket reconnection
     },
 
     beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === "VHS_ImageUploadRAM") {
-            if (!nodeData.input) nodeData.input = {};
-            if (!nodeData.input.optional) nodeData.input.optional = {};
+            if (!nodeData.input?.optional) nodeData.input = { ...nodeData.input, optional: {} };
             nodeData.input.optional["upload"] = ["BUTTON", {}];
         }
     },
 
     nodeCreated(node) {
-        // Fallback video widget if VHS.core.js did not attach "videopreview"
-        if (node.comfyClass === "VideoCombine" || node.type === "VHS_VideoCombine") {
-            setTimeout(() => {
-                if (!node.widgets?.some(w => w.name === "videopreview") && !node._fallbackVideoEl) {
-                    const videoEl = document.createElement("video");
-                    videoEl.controls = true;
-                    videoEl.autoplay = true;
-                    videoEl.loop = true;
-                    videoEl.style.width = "100%";
-                    videoEl.style.display = "none";
-                    videoEl.onloadedmetadata = () => resizeNodeForMedia(node, videoEl.videoWidth, videoEl.videoHeight);
-
-                    const domWidget = node.addDOMWidget("ram_video_fallback", "video", videoEl, { serialize: false });
-                    domWidget.serialize = false;
-                    node._fallbackVideoEl = videoEl;
-                }
-            }, 0);
-        }
-
-        // Upload & Encrypt button for VHS_ImageUploadRAM
-        if (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM") {
+        if (node.comfyClass === "VHS_ImageUploadRAM") {
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {
                     const input = document.createElement("input");
@@ -210,13 +166,18 @@ app.registerExtension({
                         if (!input.files?.length) return;
                         const file = input.files[0];
 
-                        // Instant local-only preview
+                        // Local-only preview
                         const img = new Image();
                         img.onload = () => {
-                            node.imgs = [img];
-                            resizeNodeForMedia(node, img.naturalWidth, img.naturalHeight);
+                            const minWidth = Math.max(node.size[0] || 0, 240);
+                            const aspect = img.naturalWidth / (img.naturalHeight || 1);
+                            const imgHeight = minWidth / aspect;
+                            const widgetHeight = node.widgets ? node.widgets.length * 32 : 0;
+                            node.setSize([minWidth, Math.max(120, widgetHeight + imgHeight + 60)]);
+                            node.setDirtyCanvas(true, true);
                         };
                         img.src = URL.createObjectURL(file);
+                        node.imgs = [img];
 
                         uploadBtn.label = "Encrypting...";
                         node.setDirtyCanvas(true);
@@ -246,8 +207,6 @@ app.registerExtension({
                                     widget.value = data.name;
                                 }
                             }
-                        } catch (err) {
-                            alert("Encryption upload failed: " + err.message);
                         } finally {
                             uploadBtn.label = "Upload & Encrypt (.bin)";
                             node.setDirtyCanvas(true);
@@ -256,7 +215,6 @@ app.registerExtension({
                     input.click();
                 });
                 uploadBtn.serialize = false;
-                uploadBtn.label = "Upload & Encrypt (.bin)";
             }
         }
     }

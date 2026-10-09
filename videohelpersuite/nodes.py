@@ -242,143 +242,6 @@ def to_pingpong(inp):
     for i in range(len(inp)-2,0,-1):
         yield inp[i]
 
-class VideoCombine:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "images": ("IMAGE",),
-                "frame_rate": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 120.0, "step": 1.0}),
-                "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
-                "filename_prefix": ("STRING", {"default": "RAM_Video"}),
-                "format": (["video/mp4", "video/webm"],),
-                "pingpong": ("BOOLEAN", {"default": False}),
-                "save_output": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "audio": ("AUDIO",),
-            }
-        }
-
-    CATEGORY = "Video Helper Suite"
-    RETURN_TYPES = ()
-    OUTPUT_NODE = True
-    FUNCTION = "combine_video"
-
-    def combine_video(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
-                      format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
-        if pingpong and len(images) > 2:
-            images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
-
-        num_frames, height, width, _ = images.shape
-        # Ensure even dimensions required by yuv420p encoders
-        even_h = height - (height % 2)
-        even_w = width - (width % 2)
-
-        container_fmt = "webm" if format == "video/webm" else "mp4"
-        video_io = io.BytesIO()
-        container = av.open(video_io, mode="w", format=container_fmt)
-
-        # 1. Configure Video Stream
-        v_codec = "libvpx-vp9" if container_fmt == "webm" else "h264"
-        v_stream = container.add_stream(v_codec, rate=max(1, int(round(frame_rate))))
-        v_stream.width = even_w
-        v_stream.height = even_h
-        v_stream.pix_fmt = "yuv420p"
-        if v_codec == "h264":
-            v_stream.options = {"crf": "20", "preset": "fast"}
-
-        # 2. Configure Optional Audio Stream
-        a_stream = None
-        waveform_np = None
-        sample_rate = 44100
-        layout = "stereo"
-
-        if audio is not None and isinstance(audio, dict) and "waveform" in audio:
-            waveform = audio["waveform"]
-            sample_rate = int(audio.get("sample_rate", 44100))
-            if waveform.ndim == 3:
-                waveform = waveform[0]  # [channels, samples]
-            waveform_np = waveform.detach().cpu().numpy().astype(np.float32)
-
-            channels = waveform_np.shape[0]
-            if channels == 1:
-                layout = "mono"
-            else:
-                waveform_np = waveform_np[:2]
-                layout = "stereo"
-
-            a_codec = "libopus" if container_fmt == "webm" else "aac"
-            a_stream = container.add_stream(a_codec, rate=sample_rate, layout=layout)
-
-        # 3. Encode Video Frames in RAM
-        for img_tensor in images:
-            img_np = np.clip(255.0 * img_tensor[:even_h, :even_w, :].detach().cpu().numpy(), 0, 255).astype(np.uint8)
-            frame = av.VideoFrame.from_ndarray(img_np, format="rgb24")
-            for packet in v_stream.encode(frame):
-                container.mux(packet)
-
-        for packet in v_stream.encode():
-            container.mux(packet)
-
-        # 4. Encode Optional Audio Stream in RAM (trimmed to match video length)
-        if a_stream is not None and waveform_np is not None:
-            video_duration = num_frames / float(frame_rate)
-            max_samples = int(video_duration * sample_rate)
-            waveform_np = waveform_np[:, :max_samples]
-
-            if waveform_np.shape[1] > 0:
-                resampler = av.AudioResampler(
-                    format=a_stream.format,
-                    layout=a_stream.layout,
-                    rate=a_stream.rate,
-                    frame_size=a_stream.codec_context.frame_size or 1024,
-                )
-                a_frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(waveform_np), format="fltp", layout=layout)
-                a_frame.sample_rate = sample_rate
-                a_frame.pts = 0
-
-                for r_frame in resampler.resample(a_frame):
-                    for packet in a_stream.encode(r_frame):
-                        container.mux(packet)
-                for r_frame in resampler.resample(None):
-                    for packet in a_stream.encode(r_frame):
-                        container.mux(packet)
-                for packet in a_stream.encode():
-                    container.mux(packet)
-
-        container.close()
-
-        plaintext_buf = bytearray(video_io.getvalue())
-        video_io.close()
-
-        try:
-            # 5. Encrypt in RAM
-            encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
-        finally:
-            # 6. Immediate Zeroing of Plaintext Video RAM
-            plaintext_buf[:] = b"\x00" * len(plaintext_buf)
-            del plaintext_buf
-
-        # 7. Save Ciphertext .bin
-        target_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
-        bin_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.bin"
-        bin_path = os.path.join(target_dir, bin_filename)
-
-        with open(bin_path, "wb") as f:
-            f.write(encrypted_payload)
-
-        return {
-            "ui": {
-                "ram_preview": [{
-                    "filename": bin_filename,
-                    "subfolder": "",
-                    "type": "output" if save_output else "temp",
-                    "format": format
-                }]
-            }
-        }
-    
 class LoadAudio:
     @classmethod
     def INPUT_TYPES(s):
@@ -785,9 +648,12 @@ class SelectLatest:
 import os
 import io
 import uuid
+import shutil
+import subprocess
+import threading
+import struct
 import numpy as np
 import torch
-import av
 from PIL import Image, ImageOps
 from aiohttp import web
 
@@ -798,8 +664,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import folder_paths
 from server import PromptServer
 
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
+
 # =====================================================================
-# 1. Server-Side RAM Key Management
+# Server-Side RAM Key Management
 # =====================================================================
 
 SERVER_PRIVATE_KEY = rsa.generate_private_key(
@@ -839,29 +711,8 @@ async def register_browser_key(request):
         return web.json_response({"status": "error", "message": str(e)}, status=400)
 
 
-def encrypt_buffer_for_browser(plaintext_buf: bytearray) -> bytes:
-    """Encrypts a mutable bytearray in RAM and wraps the ephemeral AES key with the Browser Public Key."""
-    if LATEST_BROWSER_PUBKEY is None:
-        raise RuntimeError("Browser Public Key not registered. Please refresh the ComfyUI browser tab.")
-
-    aes_key = os.urandom(32)
-    iv = os.urandom(12)
-    aesgcm = AESGCM(aes_key)
-    ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
-
-    wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
-        aes_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-    return wrapped_key + iv + ciphertext
-
-
 # =====================================================================
-# 2. VHS_ImageUploadRAM Node
+# VHS_ImageUploadRAM Node
 # =====================================================================
 
 class VHS_ImageUploadRAM:
@@ -887,7 +738,7 @@ class VHS_ImageUploadRAM:
             raw_payload = f.read()
 
         if len(raw_payload) < 268:
-            raise ValueError("Corrupted or invalid encrypted .bin payload.")
+            raise ValueError("Corrupted encrypted .bin payload.")
 
         wrapped_key = raw_payload[:256]
         iv = raw_payload[256:268]
@@ -924,7 +775,7 @@ class VHS_ImageUploadRAM:
 
 
 # =====================================================================
-# 3. VHS_ImagePreviewRAM Node
+# VHS_ImagePreviewRAM Node
 # =====================================================================
 
 class VHS_ImagePreviewRAM:
@@ -943,11 +794,14 @@ class VHS_ImagePreviewRAM:
     FUNCTION = "preview_ram"
 
     def preview_ram(self, images, **kwargs):
+        if LATEST_BROWSER_PUBKEY is None:
+            raise RuntimeError("Browser Public Key not registered. Refresh the ComfyUI browser tab.")
+
         temp_dir = folder_paths.get_temp_directory()
         output_files = []
 
         for img_tensor in images:
-            img_np = np.clip(255.0 * img_tensor.detach().cpu().numpy(), 0, 255).astype(np.uint8)
+            img_np = np.clip(255.0 * img_tensor.cpu().numpy(), 0, 255).astype(np.uint8)
             img = Image.fromarray(img_np)
 
             bio = io.BytesIO()
@@ -956,7 +810,19 @@ class VHS_ImagePreviewRAM:
             bio.close()
 
             try:
-                encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
+                aes_key = os.urandom(32)
+                iv = os.urandom(12)
+                aesgcm = AESGCM(aes_key)
+                ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
+
+                wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
+                    aes_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
             finally:
                 plaintext_buf[:] = b"\x00" * len(plaintext_buf)
                 del plaintext_buf
@@ -964,16 +830,197 @@ class VHS_ImagePreviewRAM:
             bin_filename = f"{uuid.uuid4().hex}.bin"
             bin_path = os.path.join(temp_dir, bin_filename)
             with open(bin_path, "wb") as f:
-                f.write(encrypted_payload)
+                f.write(wrapped_key + iv + ciphertext)
 
             output_files.append({
                 "filename": bin_filename,
                 "subfolder": "",
-                "type": "temp",
-                "format": "image/png"
+                "type": "temp"
             })
 
-        return {"ui": {"ram_preview": output_files}}
+        return {"ui": {"images": output_files}}
+
+
+# =====================================================================
+# VHS_VideoCombine (Audio Muxing via RAM pipes)
+# =====================================================================
+
+class VideoCombine:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "frame_rate": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 120.0, "step": 1.0}),
+                "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "filename_prefix": ("STRING", {"default": "RAM_Video"}),
+                "format": (["video/mp4", "video/webm"],),
+                "pingpong": ("BOOLEAN", {"default": False}),
+                "save_output": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "audio": ("AUDIO",),
+            }
+        }
+
+    CATEGORY = "Video Helper Suite"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "combine_video"
+
+    def combine_video(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
+                      format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
+        global LATEST_BROWSER_PUBKEY
+        if LATEST_BROWSER_PUBKEY is None:
+            raise RuntimeError("Browser Public Key not registered. Refresh the ComfyUI browser tab.")
+
+        if pingpong and len(images) > 2:
+            images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
+
+        num_frames, height, width, _ = images.shape
+
+        # Setup uncompressed in-memory WAV if Audio is provided
+        wav_bytes = None
+        if audio is not None:
+            waveform = audio["waveform"]
+            sample_rate = audio["sample_rate"]
+            waveform_np = waveform.cpu().numpy()
+            if waveform_np.ndim == 3:
+                waveform_np = waveform_np[0]
+            waveform_np = waveform_np.T
+
+            num_channels = waveform_np.shape[1] if waveform_np.ndim > 1 else 1
+            num_samples = len(waveform_np)
+            bits_per_sample = 16
+            byte_rate = sample_rate * num_channels * (bits_per_sample // 8)
+            block_align = num_channels * (bits_per_sample // 8)
+
+            audio_data = (waveform_np * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+            chunk_size = 36 + len(audio_data)
+
+            wav_bytes = struct.pack(
+                '<4sI4s4sIHHIIHH4sI',
+                b'RIFF', chunk_size, b'WAVE',
+                b'fmt ', 16, 1, num_channels, sample_rate, byte_rate, block_align, bits_per_sample,
+                b'data', len(audio_data)
+            ) + audio_data
+
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{width}x{height}",
+            "-r", str(frame_rate),
+            "-i", "pipe:0"
+        ]
+
+        audio_read_fd, audio_write_fd = None, None
+        if wav_bytes is not None:
+            audio_read_fd, audio_write_fd = os.pipe()
+            cmd += [
+                "-f", "wav",
+                "-i", f"pipe:{audio_read_fd}"
+            ]
+
+        if format == "video/mp4":
+            cmd += [
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "fast",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof"
+            ]
+            if wav_bytes is not None:
+                cmd += ["-c:a", "aac", "-shortest"]
+            cmd += ["-f", "mp4", "pipe:1"]
+        else:  # video/webm
+            cmd += [
+                "-c:v", "libvpx-vp9",
+                "-pix_fmt", "yuv420p"
+            ]
+            if wav_bytes is not None:
+                cmd += ["-c:a", "libvorbis", "-shortest"]
+            cmd += ["-f", "webm", "pipe:1"]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=[audio_read_fd] if audio_read_fd is not None else []
+        )
+
+        def pipe_frame_feeder():
+            try:
+                for frame in images:
+                    frame_np = (frame.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                    proc.stdin.write(frame_np.tobytes())
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        def pipe_audio_feeder():
+            try:
+                os.write(audio_write_fd, wav_bytes)
+                os.close(audio_write_fd)
+            except Exception:
+                pass
+
+        feeder_thread = threading.Thread(target=pipe_frame_feeder)
+        feeder_thread.start()
+
+        audio_thread = None
+        if audio_write_fd is not None:
+            os.close(audio_read_fd)  # close read fd in parent process
+            audio_thread = threading.Thread(target=pipe_audio_feeder)
+            audio_thread.start()
+
+        stdout_bytes, _ = proc.communicate()
+        feeder_thread.join()
+        if audio_thread is not None:
+            audio_thread.join()
+
+        if proc.returncode != 0 or not stdout_bytes:
+            raise RuntimeError("FFmpeg RAM pipeline encoding failed.")
+
+        plaintext_buf = bytearray(stdout_bytes)
+        del stdout_bytes
+
+        try:
+            aes_key = os.urandom(32)
+            iv = os.urandom(12)
+            aesgcm = AESGCM(aes_key)
+            ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
+
+            wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
+                aes_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+        finally:
+            plaintext_buf[:] = b"\x00" * len(plaintext_buf)
+            del plaintext_buf
+
+        target_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
+        bin_filename = f"{filename_prefix}_{uuid.uuid4().hex[:8]}.bin"
+        bin_path = os.path.join(target_dir, bin_filename)
+
+        with open(bin_path, "wb") as f:
+            f.write(wrapped_key + iv + ciphertext)
+
+        return {
+            "ui": {
+                "gifs": [{
+                    "filename": bin_filename,
+                    "subfolder": "",
+                    "type": "output" if save_output else "temp",
+                    "format": format
+                }]
+            }
+        }
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
