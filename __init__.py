@@ -4,7 +4,7 @@ from .videohelpersuite.server import server
 from .videohelpersuite import documentation
 from .videohelpersuite import latent_preview
 
-from .nodes import ImageUploadRAM, ImagePreviewRAM
+from .videohelpersuite.nodes import ImageUploadRAM, ImagePreviewRAM
 
 NODE_CLASS_MAPPINGS = {
     "ImageUploadRAM": ImageUploadRAM,
