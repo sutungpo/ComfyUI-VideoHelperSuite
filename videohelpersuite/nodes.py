@@ -855,7 +855,7 @@ import folder_paths
 class VHS_VideoCombine:
     """
     Video Helper Suite - Video Combine (RAM Encryption)
-    Encodes video and optional audio entirely in RAM via PyAV, encrypts container with AES-256-GCM,
+    Encodes video and audio entirely in RAM via PyAV, encrypts container with AES-256-GCM,
     zeroes plaintext memory, and saves ciphertext .bin.
     """
     @classmethod
@@ -863,7 +863,8 @@ class VHS_VideoCombine:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "frame_rate": ("FLOAT", {"default": 8.0, "min": 0.01, "max": 1000.0, "step": 1.0, "round": False}),
+                # Clean standard FLOAT specification without 'round: False' so LiteGraph does not reset to min
+                "frame_rate": ("FLOAT", {"default": 8.0, "min": 1.0, "max": 120.0, "step": 1.0, "round": 0.01}),
                 "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "filename_prefix": ("STRING", {"default": "RAM_Video"}),
                 "format": (["video/mp4", "video/webm"],),
@@ -872,8 +873,6 @@ class VHS_VideoCombine:
             },
             "optional": {
                 "audio": ("AUDIO",),
-                # Accepts sample_rate if wired/used as video frame rate; min=0.01 prevents resetting to 1
-                "sample_rate": ("FLOAT", {"default": 8.0, "min": 0.01, "max": 1000.0, "step": 1.0, "round": False}),
             }
         }
 
@@ -883,14 +882,8 @@ class VHS_VideoCombine:
     FUNCTION = "combine_video"
 
     def combine_video(self, images, frame_rate=8.0, loop_count=0, filename_prefix="RAM_Video",
-                      format="video/mp4", pingpong=False, save_output=False, audio=None,
-                      sample_rate=None, **kwargs):
-        # 1. Resolve Video FPS (Prioritize sample_rate if provided as video input)
-        video_fps = 8.0
-        if sample_rate is not None and float(sample_rate) > 0:
-            video_fps = float(sample_rate)
-        elif frame_rate is not None and float(frame_rate) > 0:
-            video_fps = float(frame_rate)
+                      format="video/mp4", pingpong=False, save_output=False, audio=None, **kwargs):
+        fps = float(frame_rate) if frame_rate and float(frame_rate) > 0 else 8.0
 
         if pingpong and len(images) > 2:
             images = torch.cat([images, images.flip(0)[1:-1]], dim=0)
@@ -903,8 +896,8 @@ class VHS_VideoCombine:
         video_io = io.BytesIO()
         container = av.open(video_io, mode="w", format=container_fmt)
 
-        # 2. Configure Video Stream with explicit Rate & Timebase
-        fps_fraction = fractions.Fraction(str(video_fps)).limit_denominator(1000)
+        # 1. Video Stream Configuration (Strict PTS & Timebase)
+        fps_fraction = fractions.Fraction(str(fps)).limit_denominator(1000)
         v_codec = "libvpx-vp9" if container_fmt == "webm" else "h264"
         v_stream = container.add_stream(v_codec, rate=fps_fraction)
         v_stream.width = even_w
@@ -914,7 +907,7 @@ class VHS_VideoCombine:
         if v_codec == "h264":
             v_stream.options = {"crf": "20", "preset": "fast"}
 
-        # 3. Robust Audio Extraction (Handles dict, LazyAudioMap, and objects)
+        # 2. Audio Stream Configuration (Explicit support for VHS LazyAudioMap and dicts)
         a_stream = None
         waveform_np = None
         audio_sr = 44100
@@ -922,7 +915,7 @@ class VHS_VideoCombine:
         if audio is not None:
             raw_waveform = None
             try:
-                # Supports dict and VHS LazyAudioMap
+                # Handles standard dict and VHS LazyAudioMap
                 if hasattr(audio, "__getitem__") and "waveform" in audio:
                     raw_waveform = audio["waveform"]
                     if "sample_rate" in audio:
@@ -943,8 +936,8 @@ class VHS_VideoCombine:
                     raw_waveform = raw_waveform[np.newaxis, :]
                 waveform_np = raw_waveform.astype(np.float32)
 
-                # Trim audio to exact video length
-                video_duration = num_frames / float(video_fps)
+                # Trim audio length to match video duration
+                video_duration = num_frames / fps
                 max_samples = int(video_duration * audio_sr)
                 waveform_np = waveform_np[:, :max_samples]
 
@@ -957,7 +950,7 @@ class VHS_VideoCombine:
                 a_stream = container.add_stream(a_codec, rate=audio_sr, layout=layout)
                 a_stream.time_base = fractions.Fraction(1, audio_sr)
 
-        # 4. Mux Video Frames with Monotonic Presentation Timestamps
+        # 3. Mux Video Frames with Monotonic Presentation Timestamps
         for i, img_tensor in enumerate(images):
             img_np = np.clip(255.0 * img_tensor[:even_h, :even_w, :].detach().cpu().numpy(), 0, 255).astype(np.uint8)
             frame = av.VideoFrame.from_ndarray(img_np, format="rgb24")
@@ -968,7 +961,7 @@ class VHS_VideoCombine:
         for packet in v_stream.encode():
             container.mux(packet)
 
-        # 5. Mux Audio Packets in Fixed 1024-Sample Frames
+        # 4. Mux Audio Packets in Fixed 1024-Sample Frames
         if a_stream is not None and waveform_np is not None and waveform_np.shape[1] > 0:
             frame_size = a_stream.codec_context.frame_size or 1024
             channels = waveform_np.shape[0]
@@ -996,7 +989,7 @@ class VHS_VideoCombine:
 
         container.close()
 
-        # 6. Encrypt in RAM, Zero Plaintext Buffer & Save Ciphertext .bin
+        # 5. Encrypt in RAM, Zero Plaintext Buffer & Save Ciphertext .bin
         plaintext_buf = bytearray(video_io.getvalue())
         video_io.close()
 

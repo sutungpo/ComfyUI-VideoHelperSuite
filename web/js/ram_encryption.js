@@ -166,11 +166,12 @@ app.registerExtension({
                         videoEl.src = blobUrl;
                         videoEl.muted = false;
                         videoEl.play().catch(() => {
+                            // Fallback for browsers that block unmuted autoplay
                             videoEl.muted = true;
                             videoEl.play().catch(() => {});
                         });
 
-                        // 3. Add Direct "Save Video" button widget onto the node
+                        // 3. Add / Update Direct "Save Video" button widget onto the node
                         let dlWidget = node.widgets?.find(w => w.name === "save_video_ram");
                         if (!dlWidget) {
                             dlWidget = node.addWidget("button", "save_video_ram", "💾 Save Video (.mp4)", () => {
