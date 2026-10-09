@@ -419,8 +419,6 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
     else:
         return ({"samples": images}, len(images), audio, video_info)
 
-
-
 import os
 import io
 import av
@@ -432,11 +430,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import folder_paths
 from comfy.utils import common_upscale
-from .nodes import SERVER_PRIVATE_KEY
 from .utils import (
     BIGMAX, DIMMAX, calculate_file_hash, strip_path, 
     floatOrInt, imageOrLatent
 )
+
+
 class LoadVideoUpload:
     @classmethod
     def INPUT_TYPES(s):
@@ -471,6 +470,9 @@ class LoadVideoUpload:
     def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
+        # Lazy import avoids top-level circular dependency between nodes.py and load_video_nodes.py
+        from .nodes import SERVER_PRIVATE_KEY
+
         # 1. Read encrypted .bin payload from disk
         video_path = folder_paths.get_annotated_filepath(strip_path(video))
         with open(video_path, "rb") as f:
@@ -493,7 +495,7 @@ class LoadVideoUpload:
             )
         )
 
-        # 3. Decrypt video payload directly into a mutable bytearray in RAM
+        # 3. Decrypt video payload into a mutable bytearray in RAM
         aesgcm = AESGCM(aes_key_bytes)
         decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
         del aes_key_bytes
