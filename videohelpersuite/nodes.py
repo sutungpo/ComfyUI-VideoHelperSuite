@@ -665,22 +665,35 @@ from server import PromptServer
 # 1. Server-Side RAM Key Management
 # =====================================================================
 
-key_cache_path = os.path.join(folder_paths.get_temp_directory(), "vhs_session_key.pem")
+temp_dir = folder_paths.get_temp_directory()
+os.makedirs(temp_dir, exist_ok=True)
+key_cache_path = os.path.join(temp_dir, "vhs_session_key.pem")
 
+SERVER_PRIVATE_KEY = None
+
+# Attempt to load existing session key
 if os.path.exists(key_cache_path):
-    with open(key_cache_path, "rb") as f:
-        SERVER_PRIVATE_KEY = serialization.load_pem_private_key(f.read(), password=None)
-else:
+    try:
+        with open(key_cache_path, "rb") as f:
+            SERVER_PRIVATE_KEY = serialization.load_pem_private_key(f.read(), password=None)
+    except Exception:
+        SERVER_PRIVATE_KEY = None
+
+# Generate new key and persist to temp directory
+if SERVER_PRIVATE_KEY is None:
     SERVER_PRIVATE_KEY = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048
     )
-    with open(key_cache_path, "wb") as f:
-        f.write(SERVER_PRIVATE_KEY.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        ))
+    try:
+        with open(key_cache_path, "wb") as f:
+            f.write(SERVER_PRIVATE_KEY.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+    except Exception as e:
+        print(f"[VHS Encryption] Warning: Could not write session key to disk: {e}")
 
 PromptServer.instance.vhs_server_private_key = SERVER_PRIVATE_KEY
 

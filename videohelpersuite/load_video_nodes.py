@@ -453,17 +453,22 @@ from .utils import (
 )
 
 def get_active_server_private_key():
-    """Retrieves the unified active private key across server restarts and module reloads."""
+    """Retrieves the unified active private key with safe directory check."""
     if hasattr(PromptServer.instance, "vhs_server_private_key"):
         return PromptServer.instance.vhs_server_private_key
 
-    # Check for persisted session key in temp directory
-    key_path = os.path.join(folder_paths.get_temp_directory(), "vhs_session_key.pem")
+    temp_dir = folder_paths.get_temp_directory()
+    os.makedirs(temp_dir, exist_ok=True)
+    key_path = os.path.join(temp_dir, "vhs_session_key.pem")
+
     if os.path.exists(key_path):
-        with open(key_path, "rb") as f:
-            key = serialization.load_pem_private_key(f.read(), password=None)
-            PromptServer.instance.vhs_server_private_key = key
-            return key
+        try:
+            with open(key_path, "rb") as f:
+                key = serialization.load_pem_private_key(f.read(), password=None)
+                PromptServer.instance.vhs_server_private_key = key
+                return key
+        except Exception:
+            pass
 
     from .nodes import SERVER_PRIVATE_KEY
     PromptServer.instance.vhs_server_private_key = SERVER_PRIVATE_KEY
