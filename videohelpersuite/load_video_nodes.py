@@ -451,7 +451,6 @@ from .utils import (
     floatOrInt, imageOrLatent
 )
 
-
 class LoadVideoUpload:
     @classmethod
     def INPUT_TYPES(s):
@@ -523,10 +522,10 @@ class LoadVideoUpload:
             del aes_key_bytes
             media_source = io.BytesIO(decrypted_buf)
         else:
-            # Standard video (output-2.mp4) is read directly without RSA decryption
             media_source = video_path
 
         try:
+            # 1. Video Frame Decoding
             with av.open(media_source) as container:
                 if not container.streams.video:
                     raise ValueError("No video stream found.")
@@ -572,45 +571,70 @@ class LoadVideoUpload:
 
                 images = torch.stack(frames)
 
-                audio = None
-                if container.streams.audio:
-                    try:
-                        astream = container.streams.audio[0]
+            # 2. Audio Extraction (Fresh Pass to Avoid Container EOF)
+            audio = None
+            audio_source = io.BytesIO(decrypted_buf) if is_encrypted else video_path
+            try:
+                with av.open(audio_source) as a_container:
+                    if a_container.streams.audio:
+                        astream = a_container.streams.audio[0]
                         sr = astream.codec_context.sample_rate
+
+                        # Resample to float32 planar stereo [2, samples]
+                        resampler = av.AudioResampler(format='fltp', layout='stereo')
                         waveforms = []
-                        for aframe in container.decode(audio=0):
-                            arr = aframe.to_ndarray()
-                            if arr.dtype == np.int16:
-                                arr = arr.astype(np.float32) / 32768.0
-                            waveforms.append(torch.from_numpy(arr).float())
+                        for aframe in a_container.decode(astream):
+                            for rframe in resampler.resample(aframe):
+                                waveforms.append(torch.from_numpy(rframe.to_ndarray()).float())
+                        for rframe in resampler.resample(None):
+                            waveforms.append(torch.from_numpy(rframe.to_ndarray()).float())
+
                         if waveforms:
-                            full_wave = torch.cat(waveforms, dim=-1)
+                            full_wave = torch.cat(waveforms, dim=-1)  # [2, total_samples]
+
+                            # Time-align audio with skipped/capped video frames
+                            if skip_first_frames > 0 and fps > 0:
+                                start_sample = int((skip_first_frames / fps) * sr)
+                                if start_sample < full_wave.shape[-1]:
+                                    full_wave = full_wave[:, start_sample:]
+
+                            eff_fps = (force_rate if force_rate > 0 else fps) / step
+                            if frame_load_cap > 0 and eff_fps > 0:
+                                max_samples = int((len(images) / eff_fps) * sr)
+                                full_wave = full_wave[:, :max_samples]
+
+                            # Standard ComfyUI 3D audio tensor: [1, channels, samples]
                             if full_wave.ndim == 2:
                                 full_wave = full_wave.unsqueeze(0)
+
                             audio = {"waveform": full_wave, "sample_rate": sr}
-                    except Exception:
-                        audio = None
+            except Exception:
+                audio = None
+            finally:
+                if isinstance(audio_source, io.BytesIO):
+                    audio_source.close()
 
-                eff_fps = (force_rate if force_rate > 0 else fps) / step
-                video_info = {
-                    "source_fps": fps,
-                    "source_frame_count": total_frames,
-                    "source_duration": duration,
-                    "source_width": orig_w,
-                    "source_height": orig_h,
-                    "loaded_fps": eff_fps,
-                    "loaded_frame_count": len(images),
-                    "loaded_duration": len(images) / eff_fps if eff_fps > 0 else 0,
-                    "loaded_width": new_w,
-                    "loaded_height": new_h,
-                }
+            eff_fps = (force_rate if force_rate > 0 else fps) / step
+            video_info = {
+                "source_fps": fps,
+                "source_frame_count": total_frames,
+                "source_duration": duration,
+                "source_width": orig_w,
+                "source_height": orig_h,
+                "loaded_fps": eff_fps,
+                "loaded_frame_count": len(images),
+                "loaded_duration": len(images) / eff_fps if eff_fps > 0 else 0,
+                "loaded_width": new_w,
+                "loaded_height": new_h,
+            }
 
-                if vae is not None:
-                    images = {"samples": vae.encode(images[:, :, :, :3])}
+            if vae is not None:
+                images = {"samples": vae.encode(images[:, :, :, :3])}
 
-                return (images, len(frames), audio, video_info)
+            return (images, len(frames), audio, video_info)
 
         finally:
+            # 3. Scrub Plaintext Media from RAM
             if decrypted_buf is not None:
                 decrypted_buf[:] = b"\x00" * len(decrypted_buf)
                 del decrypted_buf
