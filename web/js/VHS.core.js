@@ -1957,7 +1957,7 @@ app.registerExtension({
                     this.updateParameters(params, true);
                 });
             });
-            addUploadWidget(nodeType, nodeData, "video");
+            // addUploadWidget(nodeType, nodeData, "video");
             addLoadCommon(nodeType, nodeData);
             addVAEOutputToggle(nodeType, nodeData);
         } else if (nodeData?.name == "VHS_LoadAudio") {
