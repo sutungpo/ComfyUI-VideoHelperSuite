@@ -92,7 +92,7 @@ app.registerExtension({
     async setup() {
         await initCryptoSession();
 
-        // Renders decrypted previews for VHS_ImagePreviewRAM
+        // Handles decrypted previews after node execution
         api.addEventListener("executed", async ({ detail }) => {
             const items = detail?.output?.ram_preview;
             if (!items || !items.length) return;
@@ -101,21 +101,64 @@ app.registerExtension({
             if (!node) return;
 
             try {
-                const loadedImgs = [];
-                for (const item of items) {
-                    const blobUrl = await resolveEncryptedBlobUrl(item);
-                    const img = new Image();
-                    await new Promise((resolve) => {
-                        img.onload = resolve;
-                        img.onerror = resolve;
-                        img.src = blobUrl;
-                    });
-                    loadedImgs.push(img);
+                const item = items[0];
+                const blobUrl = await resolveEncryptedBlobUrl(item);
+                const isVideo = item.format?.startsWith("video/") || item.format === "image/gif";
+                const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+
+                if (isVideo && previewWidget?.videoEl) {
+                    // Attach decrypted blob to VideoCombine / LoadVideo preview widget
+                    previewWidget.videoEl.src = blobUrl;
+                    previewWidget.videoEl.hidden = false;
+                    if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
+                    if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+
+                    previewWidget.value = previewWidget.value || {};
+                    previewWidget.value.hidden = false;
+                    previewWidget.videoEl.loop = true;
+                    previewWidget.videoEl.muted = previewWidget.value.muted ?? true;
+                    previewWidget.videoEl.autoplay = true;
+
+                    previewWidget.videoEl.onloadedmetadata = () => {
+                        previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
+                        const w = node.size[0];
+                        const h = (w - 20) / previewWidget.aspectRatio + 60;
+                        node.setSize([w, Math.max(140, h)]);
+                        node.setDirtyCanvas?.(true, true);
+                        app.graph.setDirtyCanvas(true, true);
+                    };
+
+                    await previewWidget.videoEl.play().catch(() => {});
+                } else if (item.format === "image/webp" && previewWidget?.imgEl) {
+                    previewWidget.imgEl.src = blobUrl;
+                    previewWidget.imgEl.hidden = false;
+                    if (previewWidget.videoEl) previewWidget.videoEl.hidden = true;
+                    if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+
+                    previewWidget.imgEl.onload = () => {
+                        previewWidget.aspectRatio = previewWidget.imgEl.naturalWidth / previewWidget.imgEl.naturalHeight;
+                        node.setDirtyCanvas?.(true, true);
+                        app.graph.setDirtyCanvas(true, true);
+                    };
+                } else {
+                    // Fallback for image preview nodes (e.g. VHS_ImagePreviewRAM)
+                    const loadedImgs = [];
+                    for (const it of items) {
+                        const bUrl = (it === item) ? blobUrl : await resolveEncryptedBlobUrl(it);
+                        const img = new Image();
+                        await new Promise((resolve) => {
+                            img.onload = resolve;
+                            img.onerror = resolve;
+                            img.src = bUrl;
+                        });
+                        loadedImgs.push(img);
+                    }
+                    node.imgs = loadedImgs;
+                    if (loadedImgs[0]?.naturalWidth) {
+                        resizeNodeForMedia(node, loadedImgs[0].naturalWidth, loadedImgs[0].naturalHeight);
+                    }
                 }
-                node.imgs = loadedImgs;
-                if (loadedImgs[0]?.naturalWidth) {
-                    resizeNodeForMedia(node, loadedImgs[0].naturalWidth, loadedImgs[0].naturalHeight);
-                }
+
                 node.setDirtyCanvas?.(true, true);
                 app.graph.setDirtyCanvas(true, true);
             } catch (err) {
@@ -134,18 +177,20 @@ app.registerExtension({
 
     nodeCreated(node) {
         const isImage = (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM");
-        const isVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
+        const isLoadVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
+        const isVideoCombine = (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine");
 
-        if (isImage || isVideo) {
-            // Guard VHS from trying to stream raw encrypted ciphertext from server
-            if (isVideo && node.updateParameters) {
-                const origUpdate = node.updateParameters;
-                node.updateParameters = function (params, force_update) {
-                    if (params?.filename?.endsWith(".bin")) return;
-                    return origUpdate.apply(this, arguments);
-                };
-            }
+        // Guard VHS from attempting to directly stream raw encrypted ciphertext
+        if ((isLoadVideo || isVideoCombine) && node.updateParameters) {
+            const origUpdate = node.updateParameters;
+            node.updateParameters = function (params, force_update) {
+                if (params?.filename?.endsWith(".bin")) return;
+                return origUpdate.apply(this, arguments);
+            };
+        }
 
+        // Retain the full client-side encryption and upload button for input nodes
+        if (isImage || isLoadVideo) {
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const widgetKey = isImage ? "image" : "video";
                 const acceptType = isImage ? "image/*" : "video/*";
