@@ -435,6 +435,40 @@ from .utils import (
     floatOrInt, imageOrLatent
 )
 
+import os
+import io
+import av
+import torch
+import numpy as np
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+import folder_paths
+from server import PromptServer
+from comfy.utils import common_upscale
+from .utils import (
+    BIGMAX, DIMMAX, calculate_file_hash, strip_path, 
+    floatOrInt, imageOrLatent
+)
+
+def get_active_server_private_key():
+    """Retrieves the unified active private key across server restarts and module reloads."""
+    if hasattr(PromptServer.instance, "vhs_server_private_key"):
+        return PromptServer.instance.vhs_server_private_key
+
+    # Check for persisted session key in temp directory
+    key_path = os.path.join(folder_paths.get_temp_directory(), "vhs_session_key.pem")
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as f:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+            PromptServer.instance.vhs_server_private_key = key
+            return key
+
+    from .nodes import SERVER_PRIVATE_KEY
+    PromptServer.instance.vhs_server_private_key = SERVER_PRIVATE_KEY
+    return SERVER_PRIVATE_KEY
+
 
 class LoadVideoUpload:
     @classmethod
@@ -470,8 +504,7 @@ class LoadVideoUpload:
     def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
-        # Lazy import avoids top-level circular dependency between nodes.py and load_video_nodes.py
-        from .nodes import SERVER_PRIVATE_KEY
+        server_private_key = get_active_server_private_key()
 
         # 1. Read encrypted .bin payload from disk
         video_path = folder_paths.get_annotated_filepath(strip_path(video))
@@ -485,15 +518,32 @@ class LoadVideoUpload:
         iv = raw_payload[256:268]
         ciphertext = raw_payload[268:]
 
-        # 2. Decrypt ephemeral AES Key using Server's RSA Private Key
-        aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
-            wrapped_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
+        # 2. Decrypt ephemeral AES Key with MGF1 fallback
+        try:
+            aes_key_bytes = server_private_key.decrypt(
+                wrapped_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
             )
-        )
+        except ValueError:
+            try:
+                # Fallback for browser engines defaulting MGF1 to SHA-1
+                aes_key_bytes = server_private_key.decrypt(
+                    wrapped_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA1()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+            except ValueError:
+                raise ValueError(
+                    f"Decryption failed for '{video}'. The file was encrypted with a different session key. "
+                    "Please re-upload the video from the browser to encrypt it with the current server key."
+                )
 
         # 3. Decrypt video payload into a mutable bytearray in RAM
         aesgcm = AESGCM(aes_key_bytes)
@@ -529,11 +579,9 @@ class LoadVideoUpload:
                         frame_idx += 1
                         continue
 
-                    # Frame to RGB float32 [H, W, 3] in [0, 1]
                     rgb_np = frame.to_ndarray(format="rgb24").astype(np.float32) / 255.0
                     f_tensor = torch.from_numpy(rgb_np)
 
-                    # Dynamic resize if target dimensions differ
                     if new_w != orig_w or new_h != orig_h:
                         t = f_tensor.permute(2, 0, 1).unsqueeze(0)
                         t = common_upscale(t, new_w, new_h, "lanczos", "center")
@@ -548,7 +596,7 @@ class LoadVideoUpload:
                 if not frames:
                     raise RuntimeError("No frames could be extracted from the video stream.")
 
-                images = torch.stack(frames)  # [N, H, W, 3]
+                images = torch.stack(frames)
 
                 # 5. Extract In-Memory Audio if present
                 audio = None
@@ -565,7 +613,7 @@ class LoadVideoUpload:
                         if waveforms:
                             full_wave = torch.cat(waveforms, dim=-1)
                             if full_wave.ndim == 2:
-                                full_wave = full_wave.unsqueeze(0)  # [1, channels, samples]
+                                full_wave = full_wave.unsqueeze(0)
                             audio = {"waveform": full_wave, "sample_rate": sr}
                     except Exception:
                         audio = None
@@ -584,14 +632,13 @@ class LoadVideoUpload:
                     "loaded_height": new_h,
                 }
 
-                # 6. Optional VAE encoding
                 if vae is not None:
                     images = {"samples": vae.encode(images[:, :, :, :3])}
 
                 return (images, len(frames), audio, video_info)
 
         finally:
-            # 7. Secure Memory Sanitation
+            # 6. Secure Memory Sanitation
             decrypted_buf[:] = b"\x00" * len(decrypted_buf)
             del decrypted_buf
             bio.close()
@@ -606,7 +653,7 @@ class LoadVideoUpload:
         if not folder_paths.exists_annotated_filepath(strip_path(video)):
             return f"Invalid video payload file: {video}"
         return True
-
+    
 class LoadVideoPath:
     @classmethod
     def INPUT_TYPES(s):

@@ -8,6 +8,18 @@ let browserPublicKeyPEM = null;
 // =====================================================================
 // 1. Core WebCrypto & Sizing Helpers
 // =====================================================================
+async function fetchServerPublicKey() {
+    const res = await fetch("/crypto/server_pubkey");
+    const pem = await res.text();
+    serverPublicKey = await window.crypto.subtle.importKey(
+        "spki",
+        pemToArrayBuffer(pem),
+        { name: "RSA-OAEP", hash: "SHA-256" },
+        false,
+        ["wrapKey"]
+    );
+    return serverPublicKey;
+}
 
 function pemToArrayBuffer(pem) {
     const b64 = pem.replace(/-----BEGIN [^-]+-----/, "").replace(/-----END [^-]+-----/, "").replace(/\s+/g, "");
@@ -166,11 +178,14 @@ app.registerExtension({
                     node.setDirtyCanvas(true);
 
                     try {
+                        // Always fetch the active public key to prevent key mismatch
+                        const activeServerKey = await fetchServerPublicKey();
+
                         const fileBuf = await file.arrayBuffer();
                         const aesKey = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
                         const iv = window.crypto.getRandomValues(new Uint8Array(12));
                         const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuf);
-                        const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, serverPublicKey, { name: "RSA-OAEP" });
+                        const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, activeServerKey, { name: "RSA-OAEP" });
 
                         const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
                         combined.set(new Uint8Array(wrappedKey), 0);
@@ -192,7 +207,7 @@ app.registerExtension({
                             }
                         }
                     } catch (err) {
-                        alert("Video encryption upload failed: " + err.message);
+                        alert("Encryption upload failed: " + err.message);
                     } finally {
                         uploadBtn.label = "Upload & Encrypt Video (.bin)";
                         node.setDirtyCanvas(true);

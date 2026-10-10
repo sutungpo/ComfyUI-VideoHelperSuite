@@ -665,10 +665,24 @@ from server import PromptServer
 # 1. Server-Side RAM Key Management
 # =====================================================================
 
-SERVER_PRIVATE_KEY = rsa.generate_private_key(
-    public_exponent=65537,
-    key_size=2048
-)
+key_cache_path = os.path.join(folder_paths.get_temp_directory(), "vhs_session_key.pem")
+
+if os.path.exists(key_cache_path):
+    with open(key_cache_path, "rb") as f:
+        SERVER_PRIVATE_KEY = serialization.load_pem_private_key(f.read(), password=None)
+else:
+    SERVER_PRIVATE_KEY = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+    with open(key_cache_path, "wb") as f:
+        f.write(SERVER_PRIVATE_KEY.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+
+PromptServer.instance.vhs_server_private_key = SERVER_PRIVATE_KEY
 
 SERVER_PUBLIC_KEY_PEM = SERVER_PRIVATE_KEY.public_key().public_bytes(
     encoding=serialization.Encoding.PEM,
