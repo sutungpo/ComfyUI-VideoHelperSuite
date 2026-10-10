@@ -92,7 +92,7 @@ app.registerExtension({
     async setup() {
         await initCryptoSession();
 
-        // Handles decrypted previews after node execution
+        // Catch executed output, decrypt in RAM, and load into videopreview
         api.addEventListener("executed", async ({ detail }) => {
             const items = detail?.output?.ram_preview;
             if (!items || !items.length) return;
@@ -106,14 +106,17 @@ app.registerExtension({
                 const isVideo = item.format?.startsWith("video/") || item.format === "image/gif";
                 const previewWidget = node.widgets?.find(w => w.name === "videopreview");
 
+                if (previewWidget) {
+                    previewWidget.value = previewWidget.value || {};
+                    previewWidget.value.params = Object.assign({}, previewWidget.value.params, item);
+                }
+
                 if (isVideo && previewWidget?.videoEl) {
-                    // Attach decrypted blob to VideoCombine / LoadVideo preview widget
                     previewWidget.videoEl.src = blobUrl;
                     previewWidget.videoEl.hidden = false;
                     if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
                     if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
 
-                    previewWidget.value = previewWidget.value || {};
                     previewWidget.value.hidden = false;
                     previewWidget.videoEl.loop = true;
                     previewWidget.videoEl.muted = previewWidget.value.muted ?? true;
@@ -141,7 +144,7 @@ app.registerExtension({
                         app.graph.setDirtyCanvas(true, true);
                     };
                 } else {
-                    // Fallback for image preview nodes (e.g. VHS_ImagePreviewRAM)
+                    // Fallback for static image nodes (VHS_ImagePreviewRAM)
                     const loadedImgs = [];
                     for (const it of items) {
                         const bUrl = (it === item) ? blobUrl : await resolveEncryptedBlobUrl(it);
@@ -180,7 +183,7 @@ app.registerExtension({
         const isLoadVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
         const isVideoCombine = (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine");
 
-        // Guard VHS from attempting to directly stream raw encrypted ciphertext
+        // Prevent VHS from trying to stream raw ciphertext
         if ((isLoadVideo || isVideoCombine) && node.updateParameters) {
             const origUpdate = node.updateParameters;
             node.updateParameters = function (params, force_update) {
@@ -189,7 +192,7 @@ app.registerExtension({
             };
         }
 
-        // Retain the full client-side encryption and upload button for input nodes
+        // Upload and client-side encryption button for input nodes
         if (isImage || isLoadVideo) {
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const widgetKey = isImage ? "image" : "video";
@@ -203,7 +206,6 @@ app.registerExtension({
                         if (!input.files?.length) return;
                         const file = input.files[0];
 
-                        // Instant local preview
                         if (isImage) {
                             const img = new Image();
                             img.onload = () => {

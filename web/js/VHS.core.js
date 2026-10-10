@@ -1081,15 +1081,19 @@ function addPreviewOptions(nodeType) {
 
         let url = null
         if (previewWidget.videoEl?.hidden == false && previewWidget.videoEl.src) {
-            if (['input', 'output', 'temp'].includes(previewWidget.value.params.type)) {
-                //Use full quality video
+            if (previewWidget.videoEl.src.startsWith('blob:')) {
+                url = previewWidget.videoEl.src;
+            } else if (['input', 'output', 'temp'].includes(previewWidget.value?.params?.type)) {
                 url = api.apiURL('/view?' + new URLSearchParams(previewWidget.value.params));
-                //Workaround for 16bit png: Just do first frame
-                url = url.replace('%2503d', '001')
+                url = url.replace('%2503d', '001');
             }
         } else if (previewWidget.imgEl?.hidden == false && previewWidget.imgEl.src) {
-            url = previewWidget.imgEl.src;
-            url = new URL(url);
+            if (previewWidget.imgEl.src.startsWith('blob:')) {
+                url = previewWidget.imgEl.src;
+            } else {
+                url = previewWidget.imgEl.src;
+                url = new URL(url);
+            }
         }
         if (this.video_query?.source) {
             let info_string = this.video_query.source.size.join('x') +
@@ -1110,7 +1114,13 @@ function addPreviewOptions(nodeType) {
                     callback: () => {
                         const a = document.createElement("a");
                         a.href = url;
-                        a.setAttribute("download", previewWidget.value.params.filename);
+                        let filename = previewWidget.value?.params?.filename || "preview.mp4";
+                        if (filename.endsWith('.bin')) {
+                            const fmt = previewWidget.value?.params?.format || "";
+                            const ext = fmt.includes('webm') ? '.webm' : (fmt.includes('gif') ? '.gif' : (fmt.includes('webp') ? '.webp' : '.mp4'));
+                            filename = filename.replace(/\.bin$/, ext);
+                        }
+                        a.setAttribute("download", filename);
                         document.body.append(a);
                         a.click();
                         requestAnimationFrame(() => a.remove());
@@ -2180,10 +2190,10 @@ app.registerExtension({
                             v = Math.round((v + Number.EPSILON) /
                                 this.options.round) * this.options.round
                         }
-                        if (this.options.max && v > this.options.max) {
+                        if (this.options.max != null && v > this.options.max) {
                             v = this.options.max
                         }
-                        if (this.options.min && v < this.options.max) {
+                        if (this.options.min != null && v < this.options.min) {
                             v = this.options.min
                         }
                         this.value = v
@@ -2211,10 +2221,10 @@ app.registerExtension({
                         return [width, 20]
                     },
                     callback(v) {
-                        if (this.options.max && v > this.options.max) {
+                        if (this.options.max != null && v > this.options.max) {
                             v = this.options.max
                         }
-                        if (this.options.min && v < this.options.min) {
+                        if (this.options.min != null && v < this.options.min) {
                             v = this.options.min
                         }
                         if (v == 0) {

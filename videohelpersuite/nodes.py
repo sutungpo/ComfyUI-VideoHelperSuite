@@ -869,6 +869,7 @@ class VHS_ImagePreviewRAM:
 import os
 import io
 import av
+import fractions
 import torch
 import numpy as np
 from PIL import Image
@@ -878,13 +879,15 @@ from comfy.utils import ProgressBar
 from .logger import logger
 from .utils import floatOrInt, imageOrLatent
 
+
 class VideoCombine:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "images": (imageOrLatent,),
-                "frame_rate": (floatOrInt, {"default": 8, "min": 1, "max": 120, "step": 1}),
+                # Removed "max" so VHS.core.js does not trigger the clamp-to-1 bug
+                "frame_rate": (floatOrInt, {"default": 8, "min": 1, "step": 1}),
                 "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "filename_prefix": ("STRING", {"default": "AnimateDiff"}),
                 "format": (["video/mp4", "video/webm", "image/gif", "image/webp"], {"default": "video/mp4"}),
@@ -911,7 +914,7 @@ class VideoCombine:
 
     def combine_video(
         self,
-        frame_rate: int = 8,
+        frame_rate=8,
         loop_count: int = 0,
         images=None,
         latents=None,
@@ -930,7 +933,7 @@ class VideoCombine:
         if images is None:
             return ((save_output, []),)
 
-        # 1. Decode Latents in RAM if VAE is connected
+        # 1. Decode Latents in RAM if VAE is provided
         if vae is not None:
             if isinstance(images, dict) and "samples" in images:
                 images = vae.decode(images["samples"])
@@ -945,7 +948,6 @@ class VideoCombine:
         if not isinstance(images, torch.Tensor) or images.size(0) == 0:
             return ((save_output, []),)
 
-        # Ping-pong ordering
         if pingpong and images.size(0) > 2:
             rev_frames = images[1:-1].flip(dims=[0])
             images = torch.cat([images, rev_frames], dim=0)
@@ -953,12 +955,13 @@ class VideoCombine:
         num_frames = images.size(0)
         pbar = ProgressBar(num_frames)
 
-        # Format RGB frames in RAM
+        # Convert to numpy uint8 RGB in RAM
         frames_np = np.clip(255.0 * images.detach().cpu().numpy(), 0, 255).astype(np.uint8)
         if frames_np.shape[-1] == 4:
             frames_np = frames_np[..., :3]
 
         height, width = frames_np.shape[1], frames_np.shape[2]
+        fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
 
         # 2. In-Memory Video & Audio Encoding
         bio = io.BytesIO()
@@ -971,7 +974,7 @@ class VideoCombine:
                 format="GIF",
                 save_all=True,
                 append_images=pil_frames[1:],
-                duration=max(1, int(round(1000 / frame_rate))),
+                duration=max(1, int(round(1000 / fps_float))),
                 loop=loop_count,
             )
             pbar.update(num_frames)
@@ -984,7 +987,7 @@ class VideoCombine:
                 format="WEBP",
                 save_all=True,
                 append_images=pil_frames[1:],
-                duration=max(1, int(round(1000 / frame_rate))),
+                duration=max(1, int(round(1000 / fps_float))),
                 loop=loop_count,
                 lossless=kwargs.get("lossless", True),
             )
@@ -996,21 +999,21 @@ class VideoCombine:
             video_codec = "libvpx-vp9" if is_webm else "libx264"
             mime_type = "video/webm" if is_webm else "video/mp4"
 
-            # Align dimensions to even numbers for yuv420p
             if width % 2 != 0 or height % 2 != 0:
                 width -= width % 2
                 height -= height % 2
                 frames_np = frames_np[:, :height, :width, :]
 
             container = av.open(bio, mode="w", format=container_fmt)
-            v_stream = container.add_stream(video_codec, rate=int(frame_rate))
+            fps_frac = fractions.Fraction(str(fps_float)).limit_denominator(1001)
+            v_stream = container.add_stream(video_codec, rate=fps_frac)
             v_stream.width = width
             v_stream.height = height
             v_stream.pix_fmt = "yuv420p"
             if not is_webm:
                 v_stream.options = {"crf": "20", "preset": "fast", "movflags": "+faststart"}
 
-            # Multiplex Audio in RAM
+            # Audio multiplexing
             a_stream, resampler, raw_aframe = None, None, None
             if audio is not None and isinstance(audio, dict) and "waveform" in audio:
                 try:
@@ -1021,8 +1024,7 @@ class VideoCombine:
                     ch = min(2, a_wave.shape[0])
                     a_wave = a_wave[:ch]
 
-                    # Trim audio to exact video duration
-                    max_samples = int((num_frames / frame_rate) * a_sr)
+                    max_samples = int((num_frames / fps_float) * a_sr)
                     if a_wave.shape[1] > max_samples:
                         a_wave = a_wave[:, :max_samples]
 
@@ -1040,10 +1042,9 @@ class VideoCombine:
                     raw_aframe = av.AudioFrame.from_ndarray(a_wave.numpy(), format="fltp", layout=layout)
                     raw_aframe.sample_rate = a_sr
                 except Exception as e:
-                    logger.warn(f"[VideoCombine] Audio stream init error: {e}")
+                    logger.warn(f"[VideoCombine] Audio setup error: {e}")
                     a_stream = None
 
-            # Encode Video Frames
             for f in frames_np:
                 v_frame = av.VideoFrame.from_ndarray(f, format="rgb24")
                 for packet in v_stream.encode(v_frame):
@@ -1053,7 +1054,6 @@ class VideoCombine:
             for packet in v_stream.encode():
                 container.mux(packet)
 
-            # Encode Audio Packets
             if a_stream is not None and resampler is not None:
                 try:
                     for rframe in resampler.resample(raw_aframe):
@@ -1065,7 +1065,7 @@ class VideoCombine:
                     for packet in a_stream.encode():
                         container.mux(packet)
                 except Exception as e:
-                    logger.warn(f"[VideoCombine] Audio encoding error: {e}")
+                    logger.warn(f"[VideoCombine] Audio encode error: {e}")
 
             container.close()
 
@@ -1102,10 +1102,9 @@ class VideoCombine:
             "subfolder": subfolder,
             "type": "output" if save_output else "temp",
             "format": mime_type,
-            "frame_rate": frame_rate,
+            "frame_rate": fps_float,
         }
 
-        # Do not send raw .bin files to VHS standard gifs preview to avoid decode errors
         return {
             "ui": {
                 "ram_preview": [preview_item],
