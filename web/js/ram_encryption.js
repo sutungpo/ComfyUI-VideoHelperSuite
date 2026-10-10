@@ -138,20 +138,17 @@ app.registerExtension({
     },
 
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name === "VHS_ImageUploadRAM") {
-            if (!nodeData.input) nodeData.input = {};
-            if (!nodeData.input.optional) nodeData.input.optional = {};
-            nodeData.input.optional["upload"] = ["BUTTON", {}];
-        }
-        if (nodeData.name === "VHS_LoadVideo") {
-            if (!nodeData.input) nodeData.input = {};
-            if (!nodeData.input.optional) nodeData.input.optional = {};
-            nodeData.input.optional["upload_ram"] = ["BUTTON", {}];
-        }
-    },
+            if (nodeData.name === "VHS_ImageUploadRAM") {
+                if (!nodeData.input) nodeData.input = {};
+                if (!nodeData.input.optional) nodeData.input.optional = {};
+                nodeData.input.optional["upload"] = ["BUTTON", {}];
+            }
+        },
 
     nodeCreated(node) {
-        // --- A. VHS_ImageUploadRAM (Instant image preview) ---
+        // =================================================================
+        // A. VHS_ImageUploadRAM (Exact original code)
+        // =================================================================
         if (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM") {
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {
@@ -212,14 +209,10 @@ app.registerExtension({
             }
         }
 
-        // --- B. VHS_LoadVideo (Instant local video preview) ---
+        // =================================================================
+        // B. VHS_LoadVideo (Hijack the default button into a single encrypted button)
+        // =================================================================
         if (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo") {
-            // Remove VHS default unencrypted upload button
-            const unencryptedIdx = node.widgets?.findIndex(w => w.name === "choose video to upload" || w.label === "choose video to upload");
-            if (unencryptedIdx !== -1) {
-                node.widgets.splice(unencryptedIdx, 1);
-            }
-
             // Guard against VHS trying to fetch unplayable .bin from the server
             const origUpdateParameters = node.updateParameters;
             node.updateParameters = function(params, force_update) {
@@ -229,72 +222,106 @@ app.registerExtension({
                 return origUpdateParameters?.apply(this, arguments);
             };
 
-            if (!node.widgets?.some(w => w.name === "upload_ram")) {
-                const uploadBtn = node.addWidget("button", "upload_ram", "Upload & Encrypt (.bin)", () => {
-                    const input = document.createElement("input");
-                    input.type = "file";
-                    input.accept = "video/*";
-                    input.onchange = async () => {
-                        if (!input.files?.length) return;
-                        const file = input.files[0];
+            // Shared encryption upload handler
+            const handleEncryptedVideoUpload = () => {
+                const input = document.createElement("input");
+                input.type = "file";
+                input.accept = "video/*";
 
-                        // Instant local-only video preview (matching VHS_ImageUploadRAM)
-                        const previewWidget = node.widgets?.find(w => w.name === "videopreview");
-                        if (previewWidget?.videoEl) {
-                            previewWidget.videoEl.src = URL.createObjectURL(file);
-                            previewWidget.videoEl.hidden = false;
-                            if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
-                            if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
-                            previewWidget.videoEl.loop = true;
-                            previewWidget.videoEl.muted = true;
-                            previewWidget.videoEl.autoplay = true;
-                            previewWidget.videoEl.play().catch(() => {});
-                            previewWidget.videoEl.onloadedmetadata = () => {
-                                previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
-                                resizeNodeForMedia(node, previewWidget.videoEl.videoWidth, previewWidget.videoEl.videoHeight);
-                            };
-                        }
+                input.onchange = async () => {
+                    if (!input.files?.length) return;
+                    const file = input.files[0];
 
-                        uploadBtn.label = "Encrypting...";
+                    // 1. Instant local browser preview
+                    const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+                    if (previewWidget?.videoEl) {
+                        previewWidget.videoEl.src = URL.createObjectURL(file);
+                        previewWidget.videoEl.hidden = false;
+                        if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+                        if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
+                        previewWidget.videoEl.loop = true;
+                        previewWidget.videoEl.muted = true;
+                        previewWidget.videoEl.autoplay = true;
+                        previewWidget.videoEl.play().catch(() => {});
+                        previewWidget.videoEl.onloadedmetadata = () => {
+                            previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
+                            resizeNodeForMedia(node, previewWidget.videoEl.videoWidth, previewWidget.videoEl.videoHeight);
+                        };
+                    }
+
+                    // Visual feedback on the button
+                    const targetBtn = node.widgets?.find(w => w.name === "choose video to upload" || w.name === "upload_ram");
+                    if (targetBtn) {
+                        targetBtn.label = "Encrypting...";
                         node.setDirtyCanvas(true);
+                    }
 
-                        try {
-                            const fileBuf = await file.arrayBuffer();
-                            const aesKey = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
-                            const iv = window.crypto.getRandomValues(new Uint8Array(12));
-                            const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuf);
-                            const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, serverPublicKey, { name: "RSA-OAEP" });
+                    try {
+                        const fileBuf = await file.arrayBuffer();
+                        const aesKey = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+                        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+                        const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuf);
+                        const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, serverPublicKey, { name: "RSA-OAEP" });
 
-                            const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
-                            combined.set(new Uint8Array(wrappedKey), 0);
-                            combined.set(iv, 256);
-                            combined.set(new Uint8Array(ciphertext), 268);
+                        const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
+                        combined.set(new Uint8Array(wrappedKey), 0);
+                        combined.set(iv, 256);
+                        combined.set(new Uint8Array(ciphertext), 268);
 
-                            const formData = new FormData();
-                            formData.append("image", new Blob([combined]), `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`);
-                            formData.append("overwrite", "true");
+                        const formData = new FormData();
+                        formData.append("image", new Blob([combined]), `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`);
+                        formData.append("overwrite", "true");
 
-                            const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
-                            if (res.status === 200) {
-                                const data = await res.json();
-                                const widget = node.widgets.find(w => w.name === "video");
-                                if (widget) {
-                                    if (!widget.options.values.includes(data.name)) widget.options.values.push(data.name);
-                                    widget.value = data.name;
-                                }
+                        const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
+                        if (res.status === 200) {
+                            const data = await res.json();
+                            const widget = node.widgets.find(w => w.name === "video");
+                            if (widget) {
+                                if (!widget.options.values.includes(data.name)) widget.options.values.push(data.name);
+                                widget.value = data.name;
                             }
-                        } catch (err) {
-                            alert("Encryption upload failed: " + err.message);
-                        } finally {
-                            uploadBtn.label = "Upload & Encrypt (.bin)";
+                        }
+                    } catch (err) {
+                        alert("Encryption upload failed: " + err.message);
+                    } finally {
+                        if (targetBtn) {
+                            targetBtn.label = "Upload & Encrypt (.bin)";
                             node.setDirtyCanvas(true);
                         }
-                    };
-                    input.click();
-                });
-                uploadBtn.serialize = false;
-                uploadBtn.label = "Upload & Encrypt (.bin)";
-            }
+                    }
+                };
+                input.click();
+            };
+
+            // Function to configure or hijack VHS's upload button
+            const setupSingleUploadButton = () => {
+                // Remove any duplicate "upload_ram" if it was added earlier
+                const extraIdx = node.widgets?.findIndex(w => w.name === "upload_ram");
+                if (extraIdx !== -1) {
+                    node.widgets.splice(extraIdx, 1);
+                }
+
+                // Find VHS's default button
+                const defaultBtn = node.widgets?.find(w => w.name === "choose video to upload" || w.label === "choose video to upload");
+                if (defaultBtn) {
+                    defaultBtn.label = "Upload & Encrypt (.bin)";
+                    defaultBtn.callback = handleEncryptedVideoUpload;
+                } else if (!node.widgets?.some(w => w.name === "choose video to upload")) {
+                    // Fallback if VHS hasn't added it yet
+                    const uploadBtn = node.addWidget("button", "choose video to upload", "Upload & Encrypt (.bin)", handleEncryptedVideoUpload);
+                    uploadBtn.serialize = false;
+                }
+            };
+
+            setupSingleUploadButton();
+
+            // Run again on configure in case graph loading / deserialization overrides widgets
+            const origOnConfigure = node.onConfigure;
+            node.onConfigure = function() {
+                const res = origOnConfigure?.apply(this, arguments);
+                setupSingleUploadButton();
+                return res;
+            };
         }
     }
 });
