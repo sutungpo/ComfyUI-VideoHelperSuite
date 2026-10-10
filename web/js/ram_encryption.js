@@ -61,7 +61,7 @@ async function initCryptoSession() {
 }
 
 // =====================================================================
-// 2. Unified Decryption Helper (Images & Videos)
+// 2. Unified Decryption Helper
 // =====================================================================
 
 async function resolveEncryptedBlobUrl(item) {
@@ -151,7 +151,7 @@ app.registerExtension({
     },
 
     nodeCreated(node) {
-        // --- A. VHS_ImageUploadRAM (Exact original code) ---
+        // --- A. VHS_ImageUploadRAM (Instant image preview) ---
         if (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM") {
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {
@@ -162,6 +162,7 @@ app.registerExtension({
                         if (!input.files?.length) return;
                         const file = input.files[0];
 
+                        // Instant local-only preview
                         const img = new Image();
                         img.onload = () => {
                             node.imgs = [img];
@@ -211,13 +212,22 @@ app.registerExtension({
             }
         }
 
-        // --- B. VHS_LoadVideo (Remove VHS plaintext button, keep single encrypted button) ---
+        // --- B. VHS_LoadVideo (Instant local video preview) ---
         if (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo") {
             // Remove VHS default unencrypted upload button
             const unencryptedIdx = node.widgets?.findIndex(w => w.name === "choose video to upload" || w.label === "choose video to upload");
             if (unencryptedIdx !== -1) {
                 node.widgets.splice(unencryptedIdx, 1);
             }
+
+            // Guard against VHS trying to fetch unplayable .bin from the server
+            const origUpdateParameters = node.updateParameters;
+            node.updateParameters = function(params, force_update) {
+                if (params?.filename?.endsWith(".bin")) {
+                    return;
+                }
+                return origUpdateParameters?.apply(this, arguments);
+            };
 
             if (!node.widgets?.some(w => w.name === "upload_ram")) {
                 const uploadBtn = node.addWidget("button", "upload_ram", "Upload & Encrypt (.bin)", () => {
@@ -227,6 +237,23 @@ app.registerExtension({
                     input.onchange = async () => {
                         if (!input.files?.length) return;
                         const file = input.files[0];
+
+                        // Instant local-only video preview (matching VHS_ImageUploadRAM)
+                        const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+                        if (previewWidget?.videoEl) {
+                            previewWidget.videoEl.src = URL.createObjectURL(file);
+                            previewWidget.videoEl.hidden = false;
+                            if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+                            if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
+                            previewWidget.videoEl.loop = true;
+                            previewWidget.videoEl.muted = true;
+                            previewWidget.videoEl.autoplay = true;
+                            previewWidget.videoEl.play().catch(() => {});
+                            previewWidget.videoEl.onloadedmetadata = () => {
+                                previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
+                                resizeNodeForMedia(node, previewWidget.videoEl.videoWidth, previewWidget.videoEl.videoHeight);
+                            };
+                        }
 
                         uploadBtn.label = "Encrypting...";
                         node.setDirtyCanvas(true);
@@ -254,7 +281,6 @@ app.registerExtension({
                                 if (widget) {
                                     if (!widget.options.values.includes(data.name)) widget.options.values.push(data.name);
                                     widget.value = data.name;
-                                    widget.callback?.(data.name);
                                 }
                             }
                         } catch (err) {
