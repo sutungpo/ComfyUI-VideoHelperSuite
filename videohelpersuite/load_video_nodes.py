@@ -479,7 +479,11 @@ class LoadVideoUpload:
     @classmethod
     def INPUT_TYPES(s):
         input_dir = folder_paths.get_input_directory()
-        files = [f for f in os.listdir(input_dir) if f.endswith(".bin")] if os.path.exists(input_dir) else []
+        files = []
+        if os.path.exists(input_dir):
+            for f in os.listdir(input_dir):
+                if f.endswith(".bin") or any(f.lower().endswith(ext) for ext in video_extensions):
+                    files.append(f)
         return {
             "required": {
                 "video": (sorted(files),),
@@ -509,33 +513,34 @@ class LoadVideoUpload:
     def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
-        server_private_key = get_active_server_private_key()
-
-        # 1. Read encrypted .bin payload from disk
         video_path = folder_paths.get_annotated_filepath(strip_path(video))
-        with open(video_path, "rb") as f:
-            raw_payload = f.read()
+        is_encrypted = video.endswith(".bin")
 
-        if len(raw_payload) < 268:
-            raise ValueError("Corrupted or invalid encrypted .bin payload.")
+        decrypted_buf = None
+        media_source = None
 
-        wrapped_key = raw_payload[:256]
-        iv = raw_payload[256:268]
-        ciphertext = raw_payload[268:]
+        if is_encrypted:
+            with open(video_path, "rb") as f:
+                raw_payload = f.read()
 
-        # 2. Decrypt ephemeral AES Key with MGF1 fallback
-        try:
-            aes_key_bytes = server_private_key.decrypt(
-                wrapped_key,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
-            )
-        except ValueError:
+            if len(raw_payload) < 268:
+                raise ValueError("Corrupted or invalid encrypted .bin payload.")
+
+            wrapped_key = raw_payload[:256]
+            iv = raw_payload[256:268]
+            ciphertext = raw_payload[268:]
+
+            server_private_key = get_active_server_private_key()
             try:
-                # Fallback for browser engines defaulting MGF1 to SHA-1
+                aes_key_bytes = server_private_key.decrypt(
+                    wrapped_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+            except ValueError:
                 aes_key_bytes = server_private_key.decrypt(
                     wrapped_key,
                     padding.OAEP(
@@ -544,23 +549,19 @@ class LoadVideoUpload:
                         label=None
                     )
                 )
-            except ValueError:
-                raise ValueError(
-                    f"Decryption failed for '{video}'. The file was encrypted with a different session key. "
-                    "Please re-upload the video from the browser to encrypt it with the current server key."
-                )
 
-        # 3. Decrypt video payload into a mutable bytearray in RAM
-        aesgcm = AESGCM(aes_key_bytes)
-        decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
-        del aes_key_bytes
+            aesgcm = AESGCM(aes_key_bytes)
+            decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
+            del aes_key_bytes
+            media_source = io.BytesIO(decrypted_buf)
+        else:
+            # Standard unencrypted video file (e.g., .mp4, .webm)
+            media_source = video_path
 
-        bio = io.BytesIO(decrypted_buf)
         try:
-            # 4. In-Memory Demuxing and Decoding via PyAV
-            with av.open(bio) as container:
+            with av.open(media_source) as container:
                 if not container.streams.video:
-                    raise ValueError("No video stream found in the decrypted payload.")
+                    raise ValueError("No video stream found.")
 
                 vstream = container.streams.video[0]
                 fps = float(vstream.average_rate) if vstream.average_rate else 30.0
@@ -599,11 +600,10 @@ class LoadVideoUpload:
                         break
 
                 if not frames:
-                    raise RuntimeError("No frames could be extracted from the video stream.")
+                    raise RuntimeError("No frames could be extracted from video.")
 
                 images = torch.stack(frames)
 
-                # 5. Extract In-Memory Audio if present
                 audio = None
                 if container.streams.audio:
                     try:
@@ -643,10 +643,11 @@ class LoadVideoUpload:
                 return (images, len(frames), audio, video_info)
 
         finally:
-            # 6. Secure Memory Sanitation
-            decrypted_buf[:] = b"\x00" * len(decrypted_buf)
-            del decrypted_buf
-            bio.close()
+            if decrypted_buf is not None:
+                decrypted_buf[:] = b"\x00" * len(decrypted_buf)
+                del decrypted_buf
+            if isinstance(media_source, io.BytesIO):
+                media_source.close()
 
     @classmethod
     def IS_CHANGED(s, video, **kwargs):
@@ -656,7 +657,7 @@ class LoadVideoUpload:
     @classmethod
     def VALIDATE_INPUTS(s, video, **kwargs):
         if not folder_paths.exists_annotated_filepath(strip_path(video)):
-            return f"Invalid video payload file: {video}"
+            return f"Invalid video file: {video}"
         return True
     
 class LoadVideoPath:
