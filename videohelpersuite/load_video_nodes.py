@@ -440,39 +440,16 @@ import io
 import av
 import torch
 import numpy as np
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import folder_paths
-from server import PromptServer
 from comfy.utils import common_upscale
 from .utils import (
     BIGMAX, DIMMAX, calculate_file_hash, strip_path, 
     floatOrInt, imageOrLatent
 )
-
-def get_active_server_private_key():
-    """Retrieves the unified active private key with safe directory check."""
-    if hasattr(PromptServer.instance, "vhs_server_private_key"):
-        return PromptServer.instance.vhs_server_private_key
-
-    temp_dir = folder_paths.get_temp_directory()
-    os.makedirs(temp_dir, exist_ok=True)
-    key_path = os.path.join(temp_dir, "vhs_session_key.pem")
-
-    if os.path.exists(key_path):
-        try:
-            with open(key_path, "rb") as f:
-                key = serialization.load_pem_private_key(f.read(), password=None)
-                PromptServer.instance.vhs_server_private_key = key
-                return key
-        except Exception:
-            pass
-
-    from .nodes import SERVER_PRIVATE_KEY
-    PromptServer.instance.vhs_server_private_key = SERVER_PRIVATE_KEY
-    return SERVER_PRIVATE_KEY
 
 
 class LoadVideoUpload:
@@ -513,6 +490,8 @@ class LoadVideoUpload:
     def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
+        from .nodes import SERVER_PRIVATE_KEY
+
         video_path = folder_paths.get_annotated_filepath(strip_path(video))
         is_encrypted = video.endswith(".bin")
 
@@ -530,32 +509,21 @@ class LoadVideoUpload:
             iv = raw_payload[256:268]
             ciphertext = raw_payload[268:]
 
-            server_private_key = get_active_server_private_key()
-            try:
-                aes_key_bytes = server_private_key.decrypt(
-                    wrapped_key,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None
-                    )
+            aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
+                wrapped_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
                 )
-            except ValueError:
-                aes_key_bytes = server_private_key.decrypt(
-                    wrapped_key,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA1()),
-                        algorithm=hashes.SHA256(),
-                        label=None
-                    )
-                )
+            )
 
             aesgcm = AESGCM(aes_key_bytes)
             decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
             del aes_key_bytes
             media_source = io.BytesIO(decrypted_buf)
         else:
-            # Standard unencrypted video file (e.g., .mp4, .webm)
+            # Standard video (output-2.mp4) is read directly without RSA decryption
             media_source = video_path
 
         try:
