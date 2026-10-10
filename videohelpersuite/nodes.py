@@ -766,7 +766,7 @@ class VHS_ImageUploadRAM:
             "optional": {}
         }
 
-    CATEGORY = "Video Helper Suite"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("IMAGE",)
     FUNCTION = "load_image_ram"
@@ -827,7 +827,7 @@ class VHS_ImagePreviewRAM:
             "optional": {}
         }
 
-    CATEGORY = "Video Helper Suite"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "preview_ram"
