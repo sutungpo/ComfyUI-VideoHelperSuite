@@ -436,176 +436,176 @@ from .utils import (
 )
 
 
-# class LoadVideoUpload:
-#     @classmethod
-#     def INPUT_TYPES(s):
-#         input_dir = folder_paths.get_input_directory()
-#         files = [f for f in os.listdir(input_dir) if f.endswith(".bin")] if os.path.exists(input_dir) else []
-#         return {
-#             "required": {
-#                 "video": (sorted(files),),
-#                 "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
-#                 "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "disable": 0}),
-#                 "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "disable": 0}),
-#                 "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
-#                 "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
-#                 "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
-#             },
-#             "optional": {
-#                 "meta_batch": ("VHS_BatchManager",),
-#                 "vae": ("VAE",),
-#                 "format": get_load_formats(),
-#             },
-#             "hidden": {
-#                 "force_size": "STRING",
-#                 "unique_id": "UNIQUE_ID",
-#             },
-#         }
+class LoadVideoUpload:
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if f.endswith(".bin")] if os.path.exists(input_dir) else []
+        return {
+            "required": {
+                "video": (sorted(files),),
+                "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "disable": 0}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "disable": 0}),
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1, "disable": 0}),
+                "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": BIGMAX, "step": 1}),
+                "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
+            },
+            "optional": {
+                "meta_batch": ("VHS_BatchManager",),
+                "vae": ("VAE",),
+                "format": get_load_formats(),
+            },
+            "hidden": {
+                "force_size": "STRING",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
 
-#     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-#     RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO")
-#     RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
-#     FUNCTION = "load_video"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO")
+    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
+    FUNCTION = "load_video"
 
-#     def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
-#                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
-#                    vae=None, meta_batch=None, format='None', **kwargs):
-#         # Lazy import avoids top-level circular dependency between nodes.py and load_video_nodes.py
-#         from .nodes import SERVER_PRIVATE_KEY
+    def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
+                   frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
+                   vae=None, meta_batch=None, format='None', **kwargs):
+        # Lazy import avoids top-level circular dependency between nodes.py and load_video_nodes.py
+        from .nodes import SERVER_PRIVATE_KEY
 
-#         # 1. Read encrypted .bin payload from disk
-#         video_path = folder_paths.get_annotated_filepath(strip_path(video))
-#         with open(video_path, "rb") as f:
-#             raw_payload = f.read()
+        # 1. Read encrypted .bin payload from disk
+        video_path = folder_paths.get_annotated_filepath(strip_path(video))
+        with open(video_path, "rb") as f:
+            raw_payload = f.read()
 
-#         if len(raw_payload) < 268:
-#             raise ValueError("Corrupted or invalid encrypted .bin payload.")
+        if len(raw_payload) < 268:
+            raise ValueError("Corrupted or invalid encrypted .bin payload.")
 
-#         wrapped_key = raw_payload[:256]
-#         iv = raw_payload[256:268]
-#         ciphertext = raw_payload[268:]
+        wrapped_key = raw_payload[:256]
+        iv = raw_payload[256:268]
+        ciphertext = raw_payload[268:]
 
-#         # 2. Decrypt ephemeral AES Key using Server's RSA Private Key
-#         aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
-#             wrapped_key,
-#             padding.OAEP(
-#                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
-#                 algorithm=hashes.SHA256(),
-#                 label=None
-#             )
-#         )
+        # 2. Decrypt ephemeral AES Key using Server's RSA Private Key
+        aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
+            wrapped_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
 
-#         # 3. Decrypt video payload into a mutable bytearray in RAM
-#         aesgcm = AESGCM(aes_key_bytes)
-#         decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
-#         del aes_key_bytes
+        # 3. Decrypt video payload into a mutable bytearray in RAM
+        aesgcm = AESGCM(aes_key_bytes)
+        decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
+        del aes_key_bytes
 
-#         bio = io.BytesIO(decrypted_buf)
-#         try:
-#             # 4. In-Memory Demuxing and Decoding via PyAV
-#             with av.open(bio) as container:
-#                 if not container.streams.video:
-#                     raise ValueError("No video stream found in the decrypted payload.")
+        bio = io.BytesIO(decrypted_buf)
+        try:
+            # 4. In-Memory Demuxing and Decoding via PyAV
+            with av.open(bio) as container:
+                if not container.streams.video:
+                    raise ValueError("No video stream found in the decrypted payload.")
 
-#                 vstream = container.streams.video[0]
-#                 fps = float(vstream.average_rate) if vstream.average_rate else 30.0
-#                 duration = float(container.duration / av.time_base) if container.duration else 0.0
-#                 total_frames = int(vstream.frames) if vstream.frames else 0
+                vstream = container.streams.video[0]
+                fps = float(vstream.average_rate) if vstream.average_rate else 30.0
+                duration = float(container.duration / av.time_base) if container.duration else 0.0
+                total_frames = int(vstream.frames) if vstream.frames else 0
 
-#                 orig_w, orig_h = vstream.width, vstream.height
-#                 downscale_ratio = getattr(vae, "downscale_ratio", 8) if vae else 8
-#                 new_w, new_h = target_size(orig_w, orig_h, custom_width, custom_height, downscale_ratio)
+                orig_w, orig_h = vstream.width, vstream.height
+                downscale_ratio = getattr(vae, "downscale_ratio", 8) if vae else 8
+                new_w, new_h = target_size(orig_w, orig_h, custom_width, custom_height, downscale_ratio)
 
-#                 frames = []
-#                 frame_idx = 0
-#                 step = max(1, int(select_every_nth))
+                frames = []
+                frame_idx = 0
+                step = max(1, int(select_every_nth))
 
-#                 for frame in container.decode(video=0):
-#                     if frame_idx < skip_first_frames:
-#                         frame_idx += 1
-#                         continue
+                for frame in container.decode(video=0):
+                    if frame_idx < skip_first_frames:
+                        frame_idx += 1
+                        continue
 
-#                     if (frame_idx - skip_first_frames) % step != 0:
-#                         frame_idx += 1
-#                         continue
+                    if (frame_idx - skip_first_frames) % step != 0:
+                        frame_idx += 1
+                        continue
 
-#                     # Frame to RGB float32 [H, W, 3] in [0, 1]
-#                     rgb_np = frame.to_ndarray(format="rgb24").astype(np.float32) / 255.0
-#                     f_tensor = torch.from_numpy(rgb_np)
+                    # Frame to RGB float32 [H, W, 3] in [0, 1]
+                    rgb_np = frame.to_ndarray(format="rgb24").astype(np.float32) / 255.0
+                    f_tensor = torch.from_numpy(rgb_np)
 
-#                     # Dynamic resize if target dimensions differ
-#                     if new_w != orig_w or new_h != orig_h:
-#                         t = f_tensor.permute(2, 0, 1).unsqueeze(0)
-#                         t = common_upscale(t, new_w, new_h, "lanczos", "center")
-#                         f_tensor = t.squeeze(0).permute(1, 2, 0)
+                    # Dynamic resize if target dimensions differ
+                    if new_w != orig_w or new_h != orig_h:
+                        t = f_tensor.permute(2, 0, 1).unsqueeze(0)
+                        t = common_upscale(t, new_w, new_h, "lanczos", "center")
+                        f_tensor = t.squeeze(0).permute(1, 2, 0)
 
-#                     frames.append(f_tensor)
-#                     frame_idx += 1
+                    frames.append(f_tensor)
+                    frame_idx += 1
 
-#                     if frame_load_cap > 0 and len(frames) >= frame_load_cap:
-#                         break
+                    if frame_load_cap > 0 and len(frames) >= frame_load_cap:
+                        break
 
-#                 if not frames:
-#                     raise RuntimeError("No frames could be extracted from the video stream.")
+                if not frames:
+                    raise RuntimeError("No frames could be extracted from the video stream.")
 
-#                 images = torch.stack(frames)  # [N, H, W, 3]
+                images = torch.stack(frames)  # [N, H, W, 3]
 
-#                 # 5. Extract In-Memory Audio if present
-#                 audio = None
-#                 if container.streams.audio:
-#                     try:
-#                         astream = container.streams.audio[0]
-#                         sr = astream.codec_context.sample_rate
-#                         waveforms = []
-#                         for aframe in container.decode(audio=0):
-#                             arr = aframe.to_ndarray()
-#                             if arr.dtype == np.int16:
-#                                 arr = arr.astype(np.float32) / 32768.0
-#                             waveforms.append(torch.from_numpy(arr).float())
-#                         if waveforms:
-#                             full_wave = torch.cat(waveforms, dim=-1)
-#                             if full_wave.ndim == 2:
-#                                 full_wave = full_wave.unsqueeze(0)  # [1, channels, samples]
-#                             audio = {"waveform": full_wave, "sample_rate": sr}
-#                     except Exception:
-#                         audio = None
+                # 5. Extract In-Memory Audio if present
+                audio = None
+                if container.streams.audio:
+                    try:
+                        astream = container.streams.audio[0]
+                        sr = astream.codec_context.sample_rate
+                        waveforms = []
+                        for aframe in container.decode(audio=0):
+                            arr = aframe.to_ndarray()
+                            if arr.dtype == np.int16:
+                                arr = arr.astype(np.float32) / 32768.0
+                            waveforms.append(torch.from_numpy(arr).float())
+                        if waveforms:
+                            full_wave = torch.cat(waveforms, dim=-1)
+                            if full_wave.ndim == 2:
+                                full_wave = full_wave.unsqueeze(0)  # [1, channels, samples]
+                            audio = {"waveform": full_wave, "sample_rate": sr}
+                    except Exception:
+                        audio = None
 
-#                 eff_fps = (force_rate if force_rate > 0 else fps) / step
-#                 video_info = {
-#                     "source_fps": fps,
-#                     "source_frame_count": total_frames,
-#                     "source_duration": duration,
-#                     "source_width": orig_w,
-#                     "source_height": orig_h,
-#                     "loaded_fps": eff_fps,
-#                     "loaded_frame_count": len(images),
-#                     "loaded_duration": len(images) / eff_fps if eff_fps > 0 else 0,
-#                     "loaded_width": new_w,
-#                     "loaded_height": new_h,
-#                 }
+                eff_fps = (force_rate if force_rate > 0 else fps) / step
+                video_info = {
+                    "source_fps": fps,
+                    "source_frame_count": total_frames,
+                    "source_duration": duration,
+                    "source_width": orig_w,
+                    "source_height": orig_h,
+                    "loaded_fps": eff_fps,
+                    "loaded_frame_count": len(images),
+                    "loaded_duration": len(images) / eff_fps if eff_fps > 0 else 0,
+                    "loaded_width": new_w,
+                    "loaded_height": new_h,
+                }
 
-#                 # 6. Optional VAE encoding
-#                 if vae is not None:
-#                     images = {"samples": vae.encode(images[:, :, :, :3])}
+                # 6. Optional VAE encoding
+                if vae is not None:
+                    images = {"samples": vae.encode(images[:, :, :, :3])}
 
-#                 return (images, len(frames), audio, video_info)
+                return (images, len(frames), audio, video_info)
 
-#         finally:
-#             # 7. Secure Memory Sanitation
-#             decrypted_buf[:] = b"\x00" * len(decrypted_buf)
-#             del decrypted_buf
-#             bio.close()
+        finally:
+            # 7. Secure Memory Sanitation
+            decrypted_buf[:] = b"\x00" * len(decrypted_buf)
+            del decrypted_buf
+            bio.close()
 
-#     @classmethod
-#     def IS_CHANGED(s, video, **kwargs):
-#         video_path = folder_paths.get_annotated_filepath(strip_path(video))
-#         return calculate_file_hash(video_path)
+    @classmethod
+    def IS_CHANGED(s, video, **kwargs):
+        video_path = folder_paths.get_annotated_filepath(strip_path(video))
+        return calculate_file_hash(video_path)
 
-#     @classmethod
-#     def VALIDATE_INPUTS(s, video, **kwargs):
-#         if not folder_paths.exists_annotated_filepath(strip_path(video)):
-#             return f"Invalid video payload file: {video}"
-#         return True
+    @classmethod
+    def VALIDATE_INPUTS(s, video, **kwargs):
+        if not folder_paths.exists_annotated_filepath(strip_path(video)):
+            return f"Invalid video payload file: {video}"
+        return True
 
 class LoadVideoPath:
     @classmethod
