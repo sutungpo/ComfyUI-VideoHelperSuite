@@ -235,11 +235,21 @@ app.registerExtension({
                         node.setDirtyCanvas(true);
 
                         try {
+                            // Always fetch the live active server key right before encrypting
+                            const keyRes = await fetch("/crypto/server_pubkey");
+                            const activeServerKey = await window.crypto.subtle.importKey(
+                                "spki",
+                                pemToArrayBuffer(await keyRes.text()),
+                                { name: "RSA-OAEP", hash: "SHA-256" },
+                                false,
+                                ["wrapKey"]
+                            );
+
                             const fileBuf = await file.arrayBuffer();
                             const aesKey = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
                             const iv = window.crypto.getRandomValues(new Uint8Array(12));
                             const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, fileBuf);
-                            const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, serverPublicKey, { name: "RSA-OAEP" });
+                            const wrappedKey = await window.crypto.subtle.wrapKey("raw", aesKey, activeServerKey, { name: "RSA-OAEP" });
 
                             const combined = new Uint8Array(256 + 12 + ciphertext.byteLength);
                             combined.set(new Uint8Array(wrappedKey), 0);

@@ -665,13 +665,12 @@ from server import PromptServer
 # 1. Server-Side RAM Key Management
 # =====================================================================
 
-temp_dir = folder_paths.get_temp_directory()
-os.makedirs(temp_dir, exist_ok=True)
-key_cache_path = os.path.join(temp_dir, "vhs_session_key.pem")
+key_dir = os.path.dirname(os.path.abspath(__file__))
+key_cache_path = os.path.join(key_dir, "vhs_session_key.pem")
 
 SERVER_PRIVATE_KEY = None
 
-# Attempt to load existing session key
+# Attempt to load existing persistent session key
 if os.path.exists(key_cache_path):
     try:
         with open(key_cache_path, "rb") as f:
@@ -679,7 +678,7 @@ if os.path.exists(key_cache_path):
     except Exception:
         SERVER_PRIVATE_KEY = None
 
-# Generate new key and persist to temp directory
+# Generate and persist only if no key exists
 if SERVER_PRIVATE_KEY is None:
     SERVER_PRIVATE_KEY = rsa.generate_private_key(
         public_exponent=65537,
