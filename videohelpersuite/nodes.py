@@ -662,15 +662,13 @@ import folder_paths
 from server import PromptServer
 
 # =====================================================================
-# 1. Server-Side RAM Key Management
+# Server Key & Stateless Browser Key Extraction
 # =====================================================================
 
 key_dir = os.path.dirname(os.path.abspath(__file__))
 key_cache_path = os.path.join(key_dir, "vhs_session_key.pem")
 
 SERVER_PRIVATE_KEY = None
-
-# Attempt to load existing persistent session key
 if os.path.exists(key_cache_path):
     try:
         with open(key_cache_path, "rb") as f:
@@ -678,12 +676,8 @@ if os.path.exists(key_cache_path):
     except Exception:
         SERVER_PRIVATE_KEY = None
 
-# Generate and persist only if no key exists
 if SERVER_PRIVATE_KEY is None:
-    SERVER_PRIVATE_KEY = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048
-    )
+    SERVER_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     try:
         with open(key_cache_path, "wb") as f:
             f.write(SERVER_PRIVATE_KEY.private_bytes(
@@ -701,44 +695,53 @@ SERVER_PUBLIC_KEY_PEM = SERVER_PRIVATE_KEY.public_key().public_bytes(
     format=serialization.PublicFormat.SubjectPublicKeyInfo
 )
 
-LATEST_BROWSER_PUBKEY = None
-CLIENT_PUBLIC_KEYS = {}
-
 
 @PromptServer.instance.routes.get("/crypto/server_pubkey")
 async def get_server_pubkey(request):
     return web.Response(text=SERVER_PUBLIC_KEY_PEM.decode("utf-8"), content_type="text/plain")
 
 
-@PromptServer.instance.routes.post("/crypto/register_browser_key")
-async def register_browser_key(request):
-    global LATEST_BROWSER_PUBKEY
-    try:
-        data = await request.json()
-        client_id = data.get("client_id")
-        pubkey_pem = data.get("pubkey")
+def extract_browser_public_key(extra_pnginfo=None, prompt=None):
+    """Lazily extracts the browser RSA public key from the prompt metadata."""
+    pubkey_pem = None
+    if extra_pnginfo and isinstance(extra_pnginfo, dict):
+        pubkey_pem = (
+            extra_pnginfo.get("workflow", {}).get("extra", {}).get("browser_public_key")
+            or extra_pnginfo.get("extra", {}).get("browser_public_key")
+            or extra_pnginfo.get("browser_public_key")
+        )
+    if not pubkey_pem and prompt and isinstance(prompt, dict):
+        pubkey_pem = (
+            prompt.get("extra_data", {})
+            .get("extra_pnginfo", {})
+            .get("workflow", {})
+            .get("extra", {})
+            .get("browser_public_key")
+        )
 
-        pubkey_obj = serialization.load_pem_public_key(pubkey_pem.encode("utf-8"))
-        if client_id:
-            CLIENT_PUBLIC_KEYS[client_id] = pubkey_obj
-        LATEST_BROWSER_PUBKEY = pubkey_obj
+    if pubkey_pem:
+        try:
+            return serialization.load_pem_public_key(pubkey_pem.encode("utf-8"))
+        except Exception as e:
+            logger.error(f"[RAM Encryption] Failed to parse browser public key: {e}")
 
-        return web.json_response({"status": "ok"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=400)
+    return None
 
 
-def encrypt_buffer_for_browser(plaintext_buf: bytearray) -> bytes:
-    """Encrypts a mutable bytearray in RAM and wraps the ephemeral AES key with the Browser Public Key."""
-    if LATEST_BROWSER_PUBKEY is None:
-        raise RuntimeError("Browser Public Key not registered. Please refresh the ComfyUI browser tab.")
+def encrypt_buffer_for_browser(plaintext_buf: bytearray, browser_pubkey) -> bytes:
+    """Encrypts a mutable bytearray in RAM using the browser public key attached to the prompt."""
+    if browser_pubkey is None:
+        raise RuntimeError(
+            "[RAM Encryption] Browser Public Key not found in workflow metadata. "
+            "Please make sure the workflow was queued from an active browser tab."
+        )
 
     aes_key = os.urandom(32)
     iv = os.urandom(12)
     aesgcm = AESGCM(aes_key)
     ciphertext = aesgcm.encrypt(iv, bytes(plaintext_buf), None)
 
-    wrapped_key = LATEST_BROWSER_PUBKEY.encrypt(
+    wrapped_key = browser_pubkey.encrypt(
         aes_key,
         padding.OAEP(
             mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -747,7 +750,6 @@ def encrypt_buffer_for_browser(plaintext_buf: bytearray) -> bytes:
         )
     )
     return wrapped_key + iv + ciphertext
-
 
 # =====================================================================
 # 2. VHS_ImageUploadRAM Node
@@ -771,25 +773,34 @@ class VHS_ImageUploadRAM:
     FUNCTION = "load_image_ram"
 
     def load_image_ram(self, image, **kwargs):
+        from .nodes import SERVER_PRIVATE_KEY
+
         image_path = folder_paths.get_annotated_filepath(image)
         with open(image_path, "rb") as f:
             raw_payload = f.read()
 
         if len(raw_payload) < 268:
-            raise ValueError("Corrupted or invalid encrypted .bin payload.")
+            raise ValueError(f"Corrupted or invalid encrypted .bin payload: {image}")
 
         wrapped_key = raw_payload[:256]
         iv = raw_payload[256:268]
         ciphertext = raw_payload[268:]
 
-        aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
-            wrapped_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
+        try:
+            aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
+                wrapped_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
             )
-        )
+        except ValueError as e:
+            raise ValueError(
+                f"[RAM Encryption] Decryption failed for '{image}'. "
+                f"This file was encrypted with a different or expired server key. "
+                f"Please re-upload the file using the 'Upload & Encrypt (.bin)' button."
+            ) from e
 
         aesgcm = AESGCM(aes_key_bytes)
         decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))
@@ -823,7 +834,10 @@ class VHS_ImagePreviewRAM:
             "required": {
                 "images": ("IMAGE",),
             },
-            "optional": {}
+            "hidden": {
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "prompt": "PROMPT",
+            }
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
@@ -831,7 +845,8 @@ class VHS_ImagePreviewRAM:
     OUTPUT_NODE = True
     FUNCTION = "preview_ram"
 
-    def preview_ram(self, images, **kwargs):
+    def preview_ram(self, images, extra_pnginfo=None, prompt=None, **kwargs):
+        browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
         temp_dir = folder_paths.get_temp_directory()
         output_files = []
 
@@ -845,7 +860,7 @@ class VHS_ImagePreviewRAM:
             bio.close()
 
             try:
-                encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
+                encrypted_payload = encrypt_buffer_for_browser(plaintext_buf, browser_pubkey)
             finally:
                 plaintext_buf[:] = b"\x00" * len(plaintext_buf)
                 del plaintext_buf
@@ -885,7 +900,6 @@ class VideoCombine:
         return {
             "required": {
                 "images": (imageOrLatent,),
-                # Removed "max" so VHS.core.js does not trigger the clamp-to-1 bug
                 "frame_rate": (floatOrInt, {"default": 8, "min": 1, "step": 1}),
                 "loop_count": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
                 "filename_prefix": ("STRING", {"default": "AnimateDiff"}),
@@ -898,6 +912,7 @@ class VideoCombine:
                 "meta_batch": ("VHS_BatchManager",),
                 "vae": ("VAE",),
             },
+            # Explicitly declare hidden inputs so ComfyUI injects them
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
@@ -923,9 +938,15 @@ class VideoCombine:
         save_output=True,
         audio=None,
         vae=None,
+        prompt=None,             # <-- Injected via hidden["prompt"]
+        extra_pnginfo=None,      # <-- Injected via hidden["extra_pnginfo"]
         **kwargs,
     ):
         from .nodes import encrypt_buffer_for_browser
+        # Fallback to kwargs in case ComfyUI passes them as generic keyword args
+        prompt = prompt or kwargs.get("prompt")
+        extra_pnginfo = extra_pnginfo or kwargs.get("extra_pnginfo")
+        browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
 
         if latents is not None:
             images = latents
@@ -1073,7 +1094,7 @@ class VideoCombine:
         bio.close()
 
         try:
-            encrypted_payload = encrypt_buffer_for_browser(plaintext_buf)
+            encrypted_payload = encrypt_buffer_for_browser(plaintext_buf, browser_pubkey)
         finally:
             plaintext_buf[:] = b"\x00" * len(plaintext_buf)
             del plaintext_buf

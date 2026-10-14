@@ -508,14 +508,21 @@ class LoadVideoUpload:
             iv = raw_payload[256:268]
             ciphertext = raw_payload[268:]
 
-            aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
-                wrapped_key,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
+            try:
+                aes_key_bytes = SERVER_PRIVATE_KEY.decrypt(
+                    wrapped_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
                 )
-            )
+            except ValueError as e:
+                raise ValueError(
+                    f"[RAM Encryption] Decryption failed for '{video}'. "
+                    f"This video was encrypted with a different or expired server key. "
+                    f"Please re-upload the video using the 'Upload & Encrypt (.bin)' button."
+                ) from e
 
             aesgcm = AESGCM(aes_key_bytes)
             decrypted_buf = bytearray(aesgcm.decrypt(iv, ciphertext, None))

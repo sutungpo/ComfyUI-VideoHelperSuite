@@ -24,36 +24,28 @@ function resizeNodeForMedia(node, mediaWidth, mediaHeight) {
     app.graph.setDirtyCanvas(true, true);
 }
 
-async function initCryptoSession() {
-    try {
-        const res = await fetch("/crypto/server_pubkey");
-        serverPublicKey = await window.crypto.subtle.importKey(
-            "spki",
-            pemToArrayBuffer(await res.text()),
-            { name: "RSA-OAEP", hash: "SHA-256" },
-            false,
-            ["wrapKey"]
-        );
+function getDownloadFilename(item) {
+    const extMap = {
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+    };
+    const ext = extMap[item.format] || (item.format?.startsWith("video/") ? ".mp4" : ".png");
+    return (item.filename || "preview").replace(/\.bin$/, ext);
+}
 
+async function ensureBrowserKeys() {
+    if (!browserKeyPair) {
         browserKeyPair = await window.crypto.subtle.generateKey(
             { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
             true,
             ["unwrapKey", "decrypt"]
         );
-
         const exportedSpki = await window.crypto.subtle.exportKey("spki", browserKeyPair.publicKey);
         browserPublicKeyPEM = arrayBufferToPem(exportedSpki, "PUBLIC KEY");
-
-        await fetch("/crypto/register_browser_key", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ client_id: api.clientId, pubkey: browserPublicKeyPEM })
-        });
-
-        console.log("[RAM Encryption] Session ready.");
-    } catch (err) {
-        console.error("[RAM Encryption] Setup failed:", err);
     }
+    return browserPublicKeyPEM;
 }
 
 async function resolveEncryptedBlobUrl(item) {
@@ -90,9 +82,21 @@ app.registerExtension({
     name: "ComfyUI.VHS.RAMEncryption",
 
     async setup() {
-        await initCryptoSession();
+        await ensureBrowserKeys();
 
-        // Catch executed output, decrypt in RAM, and load into videopreview
+        // Attach browser public key directly to workflow metadata whenever a prompt is queued
+        const origGraphToPrompt = app.graphToPrompt;
+        app.graphToPrompt = async function () {
+            const res = await origGraphToPrompt.apply(this, arguments);
+            await ensureBrowserKeys();
+            if (res && res.workflow && browserPublicKeyPEM) {
+                res.workflow.extra = res.workflow.extra || {};
+                res.workflow.extra["browser_public_key"] = browserPublicKeyPEM;
+            }
+            return res;
+        };
+
+        // Decrypt and render previews on execution
         api.addEventListener("executed", async ({ detail }) => {
             const items = detail?.output?.ram_preview;
             if (!items || !items.length) return;
@@ -103,13 +107,15 @@ app.registerExtension({
             try {
                 const item = items[0];
                 const blobUrl = await resolveEncryptedBlobUrl(item);
+                const downloadFilename = getDownloadFilename(item);
                 const isVideo = item.format?.startsWith("video/") || item.format === "image/gif";
                 const previewWidget = node.widgets?.find(w => w.name === "videopreview");
 
-                if (previewWidget) {
-                    previewWidget.value = previewWidget.value || {};
-                    previewWidget.value.params = Object.assign({}, previewWidget.value.params, item);
-                }
+                node.decryptedMedia = {
+                    blobUrl,
+                    filename: downloadFilename,
+                    format: item.format,
+                };
 
                 if (isVideo && previewWidget?.videoEl) {
                     previewWidget.videoEl.src = blobUrl;
@@ -117,6 +123,7 @@ app.registerExtension({
                     if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
                     if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
 
+                    previewWidget.value = previewWidget.value || {};
                     previewWidget.value.hidden = false;
                     previewWidget.videoEl.loop = true;
                     previewWidget.videoEl.muted = previewWidget.value.muted ?? true;
@@ -144,7 +151,6 @@ app.registerExtension({
                         app.graph.setDirtyCanvas(true, true);
                     };
                 } else {
-                    // Fallback for static image nodes (VHS_ImagePreviewRAM)
                     const loadedImgs = [];
                     for (const it of items) {
                         const bUrl = (it === item) ? blobUrl : await resolveEncryptedBlobUrl(it);
@@ -183,7 +189,7 @@ app.registerExtension({
         const isLoadVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
         const isVideoCombine = (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine");
 
-        // Prevent VHS from trying to stream raw ciphertext
+        // Guard against VHS requesting raw ciphertext
         if ((isLoadVideo || isVideoCombine) && node.updateParameters) {
             const origUpdate = node.updateParameters;
             node.updateParameters = function (params, force_update) {
@@ -192,7 +198,39 @@ app.registerExtension({
             };
         }
 
-        // Upload and client-side encryption button for input nodes
+        // Attach "Save preview" and "Open preview" to right-click menu
+        const origGetExtraMenuOptions = node.getExtraMenuOptions;
+        node.getExtraMenuOptions = function (canvas, options) {
+            if (origGetExtraMenuOptions) {
+                origGetExtraMenuOptions.apply(this, arguments);
+            }
+            if (this.decryptedMedia?.blobUrl) {
+                const { blobUrl, filename } = this.decryptedMedia;
+                if (!options.some(opt => opt?.content === "Save preview")) {
+                    options.unshift(
+                        {
+                            content: "Save preview",
+                            callback: () => {
+                                const a = document.createElement("a");
+                                a.href = blobUrl;
+                                a.download = filename;
+                                document.body.appendChild(a);
+                                a.click();
+                                requestAnimationFrame(() => a.remove());
+                            }
+                        },
+                        {
+                            content: "Open preview",
+                            callback: () => {
+                                window.open(blobUrl, "_blank");
+                            }
+                        }
+                    );
+                }
+            }
+        };
+
+        // Client-side encryption & upload handler for input nodes
         if (isImage || isLoadVideo) {
             if (!node.widgets?.some(w => w.name === "upload")) {
                 const widgetKey = isImage ? "image" : "video";
@@ -235,7 +273,6 @@ app.registerExtension({
                         node.setDirtyCanvas(true);
 
                         try {
-                            // Always fetch the live active server key right before encrypting
                             const keyRes = await fetch("/crypto/server_pubkey");
                             const activeServerKey = await window.crypto.subtle.importKey(
                                 "spki",
