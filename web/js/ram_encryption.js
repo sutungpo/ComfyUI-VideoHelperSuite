@@ -358,43 +358,57 @@ app.registerExtension({
 
         // Dynamic output slot switcher for LoadVideoUpload
         if (isLoadVideo) {
-            const enableWidget = node.widgets?.find(w => w.name === "enable");
-            if (enableWidget) {
-                const updateOutputs = (val) => {
-                    const isVideoOnly = (val === "enable");
+            const nativeWidget = node.widgets?.find(w => w.name === "native_enable");
+            if (nativeWidget) {
+                const syncOutputs = (isNative) => {
+                    const isVideoMode = Boolean(isNative);
 
-                    // Disconnect invalid links when mode changes
-                    if (node.outputs) {
-                        for (let i = 0; i < node.outputs.length; i++) {
+                    if (!node.outputs || node.outputs.length === 0) return;
+
+                    if (isVideoMode) {
+                        // Disconnect auxiliary outputs (1, 2, 3)
+                        for (let i = node.outputs.length - 1; i >= 1; i--) {
                             node.disconnectOutput(i);
+                            node.removeOutput(i);
+                        }
+                        // Change Slot 0 to VIDEO
+                        node.outputs[0].name = "video";
+                        node.outputs[0].type = "VIDEO";
+                    } else {
+                        // Change Slot 0 to IMAGE
+                        node.outputs[0].name = "IMAGE";
+                        node.outputs[0].type = "IMAGE";
+
+                        // Restore auxiliary outputs if missing
+                        const expected = [
+                            { name: "frame_count", type: "INT" },
+                            { name: "audio", type: "AUDIO" },
+                            { name: "video_info", type: "VHS_VIDEOINFO" }
+                        ];
+
+                        for (let i = 0; i < expected.length; i++) {
+                            const targetIdx = i + 1;
+                            if (!node.outputs[targetIdx]) {
+                                node.addOutput(expected[i].name, expected[i].type);
+                            } else {
+                                node.outputs[targetIdx].name = expected[i].name;
+                                node.outputs[targetIdx].type = expected[i].type;
+                            }
                         }
                     }
 
-                    if (isVideoOnly) {
-                        node.outputs = [
-                            { name: "video", type: "VIDEO", links: null }
-                        ];
-                    } else {
-                        node.outputs = [
-                            { name: "IMAGE", type: "IMAGE", links: null },
-                            { name: "frame_count", type: "INT", links: null },
-                            { name: "audio", type: "AUDIO", links: null },
-                            { name: "video_info", type: "VHS_VIDEOINFO", links: null }
-                        ];
-                    }
                     node.setSize(node.computeSize());
                     app.graph?.setDirtyCanvas(true, true);
                 };
 
-                // Hook callback and run on initialization
-                const origCallback = enableWidget.callback;
-                enableWidget.callback = function (val) {
+                const origCallback = nativeWidget.callback;
+                nativeWidget.callback = function (val) {
                     origCallback?.apply(this, arguments);
-                    updateOutputs(val);
+                    syncOutputs(val);
                 };
 
-                // Apply initial state based on current widget value (default: disable)
-                setTimeout(() => updateOutputs(enableWidget.value || "disable"), 20);
+                // Sync slot types on initial node load
+                setTimeout(() => syncOutputs(nativeWidget.value), 20);
             }
         }
     }
