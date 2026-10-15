@@ -448,6 +448,7 @@ class LoadVideoUpload:
                 "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
             },
             "optional": {
+                "upload": ("BUTTON", {"default": False}),
                 "meta_batch": ("VHS_BatchManager",),
                 "vae": ("VAE",),
                 "format": get_load_formats(),

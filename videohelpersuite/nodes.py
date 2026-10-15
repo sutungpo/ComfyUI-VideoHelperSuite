@@ -761,7 +761,9 @@ class VHS_ImageUploadRAM:
     def INPUT_TYPES(s):
         return {
             "required": {},
-            "optional": {},
+            "optional": {
+                "upload": ("BUTTON", {"default": False}),
+            },
             "hidden": {
                 "image": "STRING",
                 "unique_id": "UNIQUE_ID",
