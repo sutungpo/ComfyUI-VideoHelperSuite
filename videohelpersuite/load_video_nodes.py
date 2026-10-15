@@ -421,6 +421,8 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
 
 import io
 import av
+from fractions import Fraction
+from comfy_api.latest import InputImpl, Types
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -464,7 +466,7 @@ class LoadVideoUpload:
     RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info", "video")
     FUNCTION = "load_video"
 
-    def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
+def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
         from .nodes import SERVER_PRIVATE_KEY
@@ -475,6 +477,7 @@ class LoadVideoUpload:
         decrypted_buf = None
         media_source = None
 
+        # 1. Decrypt into RAM buffer if encrypted (.bin)
         if is_encrypted:
             with open(video_path, "rb") as f:
                 raw_payload = f.read()
@@ -509,7 +512,7 @@ class LoadVideoUpload:
             media_source = video_path
 
         try:
-            # 1. Decode Video Frames with Timestamp-Accurate Sampling
+            # 2. Decode Video Frames with Parameter-Accurate Sampling
             with av.open(media_source) as container:
                 if not container.streams.video:
                     raise ValueError("No video stream found in media.")
@@ -569,7 +572,7 @@ class LoadVideoUpload:
 
                 images = torch.stack(frames)
 
-            # 2. Extract and Microsecond-Synchronize Audio
+            # 3. Extract and Time-Align Audio to Output Video
             audio = None
             audio_source = io.BytesIO(decrypted_buf) if is_encrypted else video_path
             try:
@@ -589,7 +592,6 @@ class LoadVideoUpload:
                         if waveforms:
                             full_wave = torch.cat(waveforms, dim=-1)
 
-                            # Time-alignment calculation
                             start_time_sec = (skip_first_frames / source_fps) if source_fps > 0 else 0.0
                             extracted_duration_sec = len(images) / effective_fps if effective_fps > 0 else 0.0
 
@@ -623,18 +625,11 @@ class LoadVideoUpload:
                 "loaded_height": new_h,
             }
 
-            # 3. Build Standard ComfyUI Native "VIDEO" Output
-            video_output = None
-            try:
-                from comfy_api.latest import InputImpl
-                video_output = InputImpl.VideoFromComponents(images=images, fps=effective_fps, audio=audio)
-            except Exception:
-                video_output = {
-                    "images": images,
-                    "fps": effective_fps,
-                    "audio": audio,
-                    "type": "VIDEO",
-                }
+            # 4. Native ComfyUI "VIDEO" Output
+            frac_fps = Fraction(str(round(effective_fps, 4))).limit_denominator(1001)
+            video_output = InputImpl.VideoFromComponents(
+                Types.VideoComponents(images=images, audio=audio, frame_rate=frac_fps)
+            )
 
             # Optional VAE encoding
             output_images = images
@@ -644,7 +639,7 @@ class LoadVideoUpload:
             return (output_images, len(frames), audio, video_info, video_output)
 
         finally:
-            # 4. Mandatory Memory Scrubbing
+            # 5. Scrub Plaintext Media from System RAM
             if decrypted_buf is not None:
                 decrypted_buf[:] = b"\x00" * len(decrypted_buf)
                 del decrypted_buf
