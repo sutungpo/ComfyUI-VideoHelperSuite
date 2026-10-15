@@ -760,13 +760,11 @@ class VHS_ImageUploadRAM:
     @classmethod
     def INPUT_TYPES(s):
         return {
-            "required": {},
-            "optional": {
-                "upload": ("BUTTON", {"default": False}),
+            "required": {
+                "image": ("STRING", {"default": ""}),  # Hidden on canvas by ram_encryption.js
             },
-            "hidden": {
-                "image": "STRING",
-                "unique_id": "UNIQUE_ID",
+            "optional": {
+                "upload": ("BUTTON", {}),
             }
         }
 
