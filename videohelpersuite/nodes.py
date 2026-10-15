@@ -756,7 +756,7 @@ def encrypt_buffer_for_browser(plaintext_buf: bytearray, browser_pubkey) -> byte
 # =====================================================================
 
 import fractions
-class ImageUploadRAM:
+class VHS_ImageUploadRAM:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -829,7 +829,7 @@ class ImageUploadRAM:
 # 2. RAM Image Preview Node
 # =====================================================================
 
-class ImagePreviewRAM:
+class VHS_ImagePreviewRAM:
     @classmethod
     def INPUT_TYPES(s):
         return {
