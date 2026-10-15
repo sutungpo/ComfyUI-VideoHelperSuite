@@ -466,7 +466,7 @@ class LoadVideoUpload:
     RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info", "video")
     FUNCTION = "load_video"
 
-def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
+    def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
         from .nodes import SERVER_PRIVATE_KEY
