@@ -430,6 +430,10 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import folder_paths
 from comfy.utils import common_upscale
 
+from fractions import Fraction
+from comfy_api.latest import InputImpl, Types
+
+
 class LoadVideoUpload:
     @classmethod
     def INPUT_TYPES(s):
@@ -442,6 +446,7 @@ class LoadVideoUpload:
         return {
             "required": {
                 "video": (sorted(files),),
+                "enable": (["disable", "enable"], {"default": "disable"}),
                 "force_rate": (floatOrInt, {"default": 0, "min": 0, "max": 60, "step": 1, "disable": 0}),
                 "custom_width": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "disable": 0}),
                 "custom_height": ("INT", {"default": 0, "min": 0, "max": DIMMAX, "disable": 0}),
@@ -450,7 +455,7 @@ class LoadVideoUpload:
                 "select_every_nth": ("INT", {"default": 1, "min": 1, "max": BIGMAX, "step": 1}),
             },
             "optional": {
-                "upload": ("BUTTON", {"default": False}),
+                "upload": ("BUTTON", {}),
                 "meta_batch": ("VHS_BatchManager",),
                 "vae": ("VAE",),
                 "format": get_load_formats(),
@@ -462,11 +467,12 @@ class LoadVideoUpload:
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    # Full superset so ComfyUI knows all valid socket types
     RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO", "VIDEO")
     RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info", "video")
     FUNCTION = "load_video"
 
-    def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
+    def load_video(self, video: str, enable="disable", force_rate=0, custom_width=0, custom_height=0,
                    frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
                    vae=None, meta_batch=None, format='None', **kwargs):
         from .nodes import SERVER_PRIVATE_KEY
@@ -477,7 +483,7 @@ class LoadVideoUpload:
         decrypted_buf = None
         media_source = None
 
-        # 1. Decrypt into RAM buffer if encrypted (.bin)
+        # 1. In-RAM Decryption for .bin
         if is_encrypted:
             with open(video_path, "rb") as f:
                 raw_payload = f.read()
@@ -538,7 +544,6 @@ class LoadVideoUpload:
                 for frame in container.decode(video=0):
                     f_time = float(frame.time) if frame.time is not None else (frame_idx / source_fps)
 
-                    # Subsample based on target rate if force_rate is active
                     if force_rate > 0:
                         if f_time < next_target_time - (time_step * 0.45):
                             frame_idx += 1
@@ -572,7 +577,7 @@ class LoadVideoUpload:
 
                 images = torch.stack(frames)
 
-            # 3. Extract and Time-Align Audio to Output Video
+            # 3. Audio Extraction (Microsecond-aligned)
             audio = None
             audio_source = io.BytesIO(decrypted_buf) if is_encrypted else video_path
             try:
@@ -603,7 +608,7 @@ class LoadVideoUpload:
                             full_wave = full_wave[:, :max_samples]
 
                             if full_wave.ndim == 2:
-                                full_wave = full_wave.unsqueeze(0)  # [1, channels, samples]
+                                full_wave = full_wave.unsqueeze(0)
 
                             audio = {"waveform": full_wave, "sample_rate": sr}
             except Exception:
@@ -612,6 +617,16 @@ class LoadVideoUpload:
                 if isinstance(audio_source, io.BytesIO):
                     audio_source.close()
 
+            # 4. Conditional Output Selection
+            if enable == "enable":
+                # Only return VIDEO
+                frac_fps = Fraction(str(round(effective_fps, 4))).limit_denominator(1001)
+                video_output = InputImpl.VideoFromComponents(
+                    Types.VideoComponents(images=images, audio=audio, frame_rate=frac_fps)
+                )
+                return (video_output,)
+
+            # Default: return IMAGE, frame_count, audio, video_info
             video_info = {
                 "source_fps": source_fps,
                 "source_frame_count": total_frames,
@@ -625,26 +640,29 @@ class LoadVideoUpload:
                 "loaded_height": new_h,
             }
 
-            # 4. Native ComfyUI "VIDEO" Output
-            frac_fps = Fraction(str(round(effective_fps, 4))).limit_denominator(1001)
-            video_output = InputImpl.VideoFromComponents(
-                Types.VideoComponents(images=images, audio=audio, frame_rate=frac_fps)
-            )
-
-            # Optional VAE encoding
             output_images = images
             if vae is not None:
                 output_images = {"samples": vae.encode(images[:, :, :, :3])}
 
-            return (output_images, len(frames), audio, video_info, video_output)
+            return (output_images, len(frames), audio, video_info)
 
         finally:
-            # 5. Scrub Plaintext Media from System RAM
             if decrypted_buf is not None:
                 decrypted_buf[:] = b"\x00" * len(decrypted_buf)
                 del decrypted_buf
             if isinstance(media_source, io.BytesIO):
                 media_source.close()
+
+    @classmethod
+    def IS_CHANGED(s, video, **kwargs):
+        video_path = folder_paths.get_annotated_filepath(strip_path(video))
+        return calculate_file_hash(video_path)
+
+    @classmethod
+    def VALIDATE_INPUTS(s, video, **kwargs):
+        if not folder_paths.exists_annotated_filepath(strip_path(video)):
+            return f"Invalid video file: {video}"
+        return True
     
 class LoadVideoPath:
     @classmethod

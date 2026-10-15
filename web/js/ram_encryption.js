@@ -355,5 +355,47 @@ app.registerExtension({
             uploadBtn.label = "Upload & Encrypt (.bin)";
             uploadBtn.callback = () => handleFileUpload(node, isImage, uploadBtn);
         }
+
+        // Dynamic output slot switcher for LoadVideoUpload
+        if (isLoadVideo) {
+            const enableWidget = node.widgets?.find(w => w.name === "enable");
+            if (enableWidget) {
+                const updateOutputs = (val) => {
+                    const isVideoOnly = (val === "enable");
+
+                    // Disconnect invalid links when mode changes
+                    if (node.outputs) {
+                        for (let i = 0; i < node.outputs.length; i++) {
+                            node.disconnectOutput(i);
+                        }
+                    }
+
+                    if (isVideoOnly) {
+                        node.outputs = [
+                            { name: "video", type: "VIDEO", links: null }
+                        ];
+                    } else {
+                        node.outputs = [
+                            { name: "IMAGE", type: "IMAGE", links: null },
+                            { name: "frame_count", type: "INT", links: null },
+                            { name: "audio", type: "AUDIO", links: null },
+                            { name: "video_info", type: "VHS_VIDEOINFO", links: null }
+                        ];
+                    }
+                    node.setSize(node.computeSize());
+                    app.graph?.setDirtyCanvas(true, true);
+                };
+
+                // Hook callback and run on initialization
+                const origCallback = enableWidget.callback;
+                enableWidget.callback = function (val) {
+                    origCallback?.apply(this, arguments);
+                    updateOutputs(val);
+                };
+
+                // Apply initial state based on current widget value (default: disable)
+                setTimeout(() => updateOutputs(enableWidget.value || "disable"), 20);
+            }
+        }
     }
 });
