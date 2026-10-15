@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-// --- Session Crypto State ---
+// --- Session WebCrypto State ---
 let browserKeyPair = null;
 let browserPublicKeyPEM = null;
 
@@ -76,7 +76,7 @@ async function resolveEncryptedBlobUrl(item) {
     return URL.createObjectURL(new Blob([decrypted], { type: item.format || "application/octet-stream" }));
 }
 
-// --- Core Client-Side Upload & Encrypt Handler ---
+// --- Upload & Local Encrypt Handler ---
 function handleFileUpload(node, isImage, uploadBtn) {
     const input = document.createElement("input");
     input.type = "file";
@@ -93,14 +93,19 @@ function handleFileUpload(node, isImage, uploadBtn) {
                 node.imgs = [img];
                 resizeNodeForMedia(node, img.naturalWidth, img.naturalHeight);
             };
-            img.src = URL.createObjectURL(file);
+            const blobUrl = URL.createObjectURL(file);
+            img.src = blobUrl;
+            setDecryptedMedia(node, blobUrl, file.name, file.type);
         } else {
             const previewWidget = node.widgets?.find(w => w.name === "videopreview");
             if (previewWidget?.videoEl) {
-                previewWidget.videoEl.src = URL.createObjectURL(file);
+                const blobUrl = URL.createObjectURL(file);
+                previewWidget.videoEl.src = blobUrl;
                 previewWidget.videoEl.hidden = false;
                 if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
                 if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
+                previewWidget.value = previewWidget.value || {};
+                previewWidget.value.hidden = false;
                 previewWidget.videoEl.loop = true;
                 previewWidget.videoEl.muted = true;
                 previewWidget.videoEl.autoplay = true;
@@ -109,6 +114,7 @@ function handleFileUpload(node, isImage, uploadBtn) {
                     previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
                     resizeNodeForMedia(node, previewWidget.videoEl.videoWidth, previewWidget.videoEl.videoHeight);
                 };
+                setDecryptedMedia(node, blobUrl, file.name, file.type);
             }
         }
 
@@ -147,7 +153,8 @@ function handleFileUpload(node, isImage, uploadBtn) {
             if (!res.ok) throw new Error(`Server returned status ${res.status}`);
             const data = await res.json();
 
-            // 4. Update the node's target widget so ComfyUI passes the filename to Python
+            // 4. Update widget value so ComfyUI passes filename to Python
+            // DO NOT call targetWidget.callback() here — that invites VHS to overwrite local preview
             const targetWidgetName = isImage ? "image" : "video";
             const targetWidget = node.widgets?.find(w => w.name === targetWidgetName);
             if (targetWidget) {
@@ -155,7 +162,6 @@ function handleFileUpload(node, isImage, uploadBtn) {
                     targetWidget.options.values.push(data.name);
                 }
                 targetWidget.value = data.name;
-                targetWidget.callback?.(data.name);
             }
 
             app.graph?.setDirtyCanvas(true, true);
@@ -189,7 +195,7 @@ app.registerExtension({
             return res;
         };
 
-        // Decrypt and display previews in local browser upon execution
+        // Decrypt and display output previews locally on execution
         api.addEventListener("executed", async ({ detail }) => {
             const items = detail?.output?.ram_preview;
             if (!items?.length) return;
@@ -268,7 +274,16 @@ app.registerExtension({
         const isLoadVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
         const isVideoCombine = (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine");
 
-        // 1. Guard against VHS requesting raw ciphertext
+        // Clean up blob URLs when node is removed
+        const origOnRemoved = node.onRemoved;
+        node.onRemoved = function () {
+            origOnRemoved?.apply(this, arguments);
+            if (node.decryptedMedia?.blobUrl?.startsWith("blob:")) {
+                URL.revokeObjectURL(node.decryptedMedia.blobUrl);
+            }
+        };
+
+        // 1. Guard against VHS requesting raw ciphertext via updateParameters
         if ((isLoadVideo || isVideoCombine) && node.updateParameters) {
             const origUpdate = node.updateParameters;
             node.updateParameters = function (params) {
@@ -277,7 +292,20 @@ app.registerExtension({
             };
         }
 
-        // 2. Extra context menu options for saving decrypted media
+        // 2. Guard against VHS replacing working preview with remote .bin via updateSource
+        if (isLoadVideo || isVideoCombine) {
+            const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+            if (previewWidget && previewWidget.updateSource) {
+                const origUpdateSource = previewWidget.updateSource;
+                previewWidget.updateSource = function () {
+                    const currentFile = node.widgets?.find(w => w.name === "video")?.value;
+                    if (currentFile?.endsWith(".bin")) return;
+                    return origUpdateSource.apply(this, arguments);
+                };
+            }
+        }
+
+        // 3. Extra context menu options for saving decrypted media
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
@@ -306,15 +334,16 @@ app.registerExtension({
             }
         };
 
-        // 3. Upload button setup for input nodes
+        // 4. Upload button setup for input nodes
         if (isImage || isLoadVideo) {
             // For ImageUploadRAM: Hide the "image" input widget completely from the canvas
             if (isImage) {
-                const imgWidget = node.widgets?.find(w => w.name === "image");
-                if (imgWidget) {
-                    imgWidget.type = "hidden";
-                    imgWidget.computeSize = () => [0, -4];
+                let imgWidget = node.widgets?.find(w => w.name === "image");
+                if (!imgWidget) {
+                    imgWidget = node.addWidget("text", "image", "", () => {}, { serialize: true });
                 }
+                imgWidget.type = "hidden";
+                imgWidget.computeSize = () => [0, -4];
             }
 
             // Always guarantee the upload button exists with the proper handler attached
