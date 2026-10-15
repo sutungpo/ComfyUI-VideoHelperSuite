@@ -419,37 +419,14 @@ def load_video(meta_batch=None, unique_id=None, memory_limit_mb=None, vae=None,
     else:
         return ({"samples": images}, len(images), audio, video_info)
 
-import os
 import io
 import av
-import torch
-import numpy as np
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import folder_paths
 from comfy.utils import common_upscale
-from .utils import (
-    BIGMAX, DIMMAX, calculate_file_hash, strip_path, 
-    floatOrInt, imageOrLatent
-)
-
-import os
-import io
-import av
-import torch
-import numpy as np
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-import folder_paths
-from comfy.utils import common_upscale
-from .utils import (
-    BIGMAX, DIMMAX, calculate_file_hash, strip_path, 
-    floatOrInt, imageOrLatent
-)
 
 class LoadVideoUpload:
     @classmethod
@@ -482,8 +459,8 @@ class LoadVideoUpload:
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-    RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO")
-    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
+    RETURN_TYPES = (imageOrLatent, "INT", "AUDIO", "VHS_VIDEOINFO", "VIDEO")
+    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info", "video")
     FUNCTION = "load_video"
 
     def load_video(self, video: str, force_rate=0, custom_width=0, custom_height=0,
@@ -517,11 +494,10 @@ class LoadVideoUpload:
                         label=None
                     )
                 )
-            except ValueError as e:
+            except Exception as e:
                 raise ValueError(
                     f"[RAM Encryption] Decryption failed for '{video}'. "
-                    f"This video was encrypted with a different or expired server key. "
-                    f"Please re-upload the video using the 'Upload & Encrypt (.bin)' button."
+                    f"Session key mismatch. Please re-upload using 'Upload & Encrypt (.bin)'."
                 ) from e
 
             aesgcm = AESGCM(aes_key_bytes)
@@ -532,13 +508,13 @@ class LoadVideoUpload:
             media_source = video_path
 
         try:
-            # 1. Video Frame Decoding
+            # 1. Decode Video Frames with Timestamp-Accurate Sampling
             with av.open(media_source) as container:
                 if not container.streams.video:
-                    raise ValueError("No video stream found.")
+                    raise ValueError("No video stream found in media.")
 
                 vstream = container.streams.video[0]
-                fps = float(vstream.average_rate) if vstream.average_rate else 30.0
+                source_fps = float(vstream.average_rate) if vstream.average_rate else 30.0
                 duration = float(container.duration / av.time_base) if container.duration else 0.0
                 total_frames = int(vstream.frames) if vstream.frames else 0
 
@@ -546,11 +522,25 @@ class LoadVideoUpload:
                 downscale_ratio = getattr(vae, "downscale_ratio", 8) if vae else 8
                 new_w, new_h = target_size(orig_w, orig_h, custom_width, custom_height, downscale_ratio)
 
+                step = max(1, int(select_every_nth))
+                target_rate = float(force_rate) if float(force_rate) > 0 else source_fps
+                effective_fps = target_rate / step
+
                 frames = []
                 frame_idx = 0
-                step = max(1, int(select_every_nth))
+                next_target_time = 0.0
+                time_step = 1.0 / target_rate if target_rate > 0 else (1.0 / source_fps)
 
                 for frame in container.decode(video=0):
+                    f_time = float(frame.time) if frame.time is not None else (frame_idx / source_fps)
+
+                    # Subsample based on target rate if force_rate is active
+                    if force_rate > 0:
+                        if f_time < next_target_time - (time_step * 0.45):
+                            frame_idx += 1
+                            continue
+                        next_target_time += time_step
+
                     if frame_idx < skip_first_frames:
                         frame_idx += 1
                         continue
@@ -574,11 +564,11 @@ class LoadVideoUpload:
                         break
 
                 if not frames:
-                    raise RuntimeError("No frames could be extracted from video.")
+                    raise RuntimeError("No frames could be extracted with the given parameters.")
 
                 images = torch.stack(frames)
 
-            # 2. Audio Extraction (Fresh Pass to Avoid Container EOF)
+            # 2. Extract and Microsecond-Synchronize Audio
             audio = None
             audio_source = io.BytesIO(decrypted_buf) if is_encrypted else video_path
             try:
@@ -587,7 +577,6 @@ class LoadVideoUpload:
                         astream = a_container.streams.audio[0]
                         sr = astream.codec_context.sample_rate
 
-                        # Resample to float32 planar stereo [2, samples]
                         resampler = av.AudioResampler(format='fltp', layout='stereo')
                         waveforms = []
                         for aframe in a_container.decode(astream):
@@ -597,22 +586,21 @@ class LoadVideoUpload:
                             waveforms.append(torch.from_numpy(rframe.to_ndarray()).float())
 
                         if waveforms:
-                            full_wave = torch.cat(waveforms, dim=-1)  # [2, total_samples]
+                            full_wave = torch.cat(waveforms, dim=-1)
 
-                            # Time-align audio with skipped/capped video frames
-                            if skip_first_frames > 0 and fps > 0:
-                                start_sample = int((skip_first_frames / fps) * sr)
-                                if start_sample < full_wave.shape[-1]:
-                                    full_wave = full_wave[:, start_sample:]
+                            # Time-alignment calculation
+                            start_time_sec = (skip_first_frames / source_fps) if source_fps > 0 else 0.0
+                            extracted_duration_sec = len(images) / effective_fps if effective_fps > 0 else 0.0
 
-                            eff_fps = (force_rate if force_rate > 0 else fps) / step
-                            if frame_load_cap > 0 and eff_fps > 0:
-                                max_samples = int((len(images) / eff_fps) * sr)
-                                full_wave = full_wave[:, :max_samples]
+                            start_sample = int(round(start_time_sec * sr))
+                            max_samples = int(round(extracted_duration_sec * sr))
 
-                            # Standard ComfyUI 3D audio tensor: [1, channels, samples]
+                            if start_sample < full_wave.shape[-1]:
+                                full_wave = full_wave[:, start_sample:]
+                            full_wave = full_wave[:, :max_samples]
+
                             if full_wave.ndim == 2:
-                                full_wave = full_wave.unsqueeze(0)
+                                full_wave = full_wave.unsqueeze(0)  # [1, channels, samples]
 
                             audio = {"waveform": full_wave, "sample_rate": sr}
             except Exception:
@@ -621,43 +609,46 @@ class LoadVideoUpload:
                 if isinstance(audio_source, io.BytesIO):
                     audio_source.close()
 
-            eff_fps = (force_rate if force_rate > 0 else fps) / step
             video_info = {
-                "source_fps": fps,
+                "source_fps": source_fps,
                 "source_frame_count": total_frames,
                 "source_duration": duration,
                 "source_width": orig_w,
                 "source_height": orig_h,
-                "loaded_fps": eff_fps,
+                "loaded_fps": effective_fps,
                 "loaded_frame_count": len(images),
-                "loaded_duration": len(images) / eff_fps if eff_fps > 0 else 0,
+                "loaded_duration": len(images) / effective_fps if effective_fps > 0 else 0.0,
                 "loaded_width": new_w,
                 "loaded_height": new_h,
             }
 
-            if vae is not None:
-                images = {"samples": vae.encode(images[:, :, :, :3])}
+            # 3. Build Standard ComfyUI Native "VIDEO" Output
+            video_output = None
+            try:
+                from comfy_api.latest import InputImpl
+                video_output = InputImpl.VideoFromComponents(images=images, fps=effective_fps, audio=audio)
+            except Exception:
+                video_output = {
+                    "images": images,
+                    "fps": effective_fps,
+                    "audio": audio,
+                    "type": "VIDEO",
+                }
 
-            return (images, len(frames), audio, video_info)
+            # Optional VAE encoding
+            output_images = images
+            if vae is not None:
+                output_images = {"samples": vae.encode(images[:, :, :, :3])}
+
+            return (output_images, len(frames), audio, video_info, video_output)
 
         finally:
-            # 3. Scrub Plaintext Media from RAM
+            # 4. Mandatory Memory Scrubbing
             if decrypted_buf is not None:
                 decrypted_buf[:] = b"\x00" * len(decrypted_buf)
                 del decrypted_buf
             if isinstance(media_source, io.BytesIO):
                 media_source.close()
-
-    @classmethod
-    def IS_CHANGED(s, video, **kwargs):
-        video_path = folder_paths.get_annotated_filepath(strip_path(video))
-        return calculate_file_hash(video_path)
-
-    @classmethod
-    def VALIDATE_INPUTS(s, video, **kwargs):
-        if not folder_paths.exists_annotated_filepath(strip_path(video)):
-            return f"Invalid video file: {video}"
-        return True
     
 class LoadVideoPath:
     @classmethod

@@ -752,19 +752,20 @@ def encrypt_buffer_for_browser(plaintext_buf: bytearray, browser_pubkey) -> byte
     return wrapped_key + iv + ciphertext
 
 # =====================================================================
-# 2. VHS_ImageUploadRAM Node
+# 1. Zero-Input RAM Image Upload Node
 # =====================================================================
 
-class VHS_ImageUploadRAM:
+import fractions
+class ImageUploadRAM:
     @classmethod
     def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = [f for f in os.listdir(input_dir) if f.endswith(".bin")] if os.path.exists(input_dir) else []
         return {
-            "required": {
-                "image": (sorted(files),),
-            },
-            "optional": {}
+            "required": {},
+            "optional": {},
+            "hidden": {
+                "image": "STRING",
+                "unique_id": "UNIQUE_ID",
+            }
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
@@ -772,8 +773,10 @@ class VHS_ImageUploadRAM:
     RETURN_NAMES = ("IMAGE",)
     FUNCTION = "load_image_ram"
 
-    def load_image_ram(self, image, **kwargs):
+    def load_image_ram(self, image=None, **kwargs):
         from .nodes import SERVER_PRIVATE_KEY
+        if not image:
+            raise ValueError("[RAM Encryption] No image uploaded. Please click 'Upload & Encrypt (.bin)'.")
 
         image_path = folder_paths.get_annotated_filepath(image)
         with open(image_path, "rb") as f:
@@ -795,11 +798,10 @@ class VHS_ImageUploadRAM:
                     label=None
                 )
             )
-        except ValueError as e:
+        except Exception as e:
             raise ValueError(
                 f"[RAM Encryption] Decryption failed for '{image}'. "
-                f"This file was encrypted with a different or expired server key. "
-                f"Please re-upload the file using the 'Upload & Encrypt (.bin)' button."
+                f"Session key mismatch. Please re-upload using 'Upload & Encrypt (.bin)'."
             ) from e
 
         aesgcm = AESGCM(aes_key_bytes)
@@ -824,10 +826,10 @@ class VHS_ImageUploadRAM:
 
 
 # =====================================================================
-# 3. VHS_ImagePreviewRAM Node
+# 2. RAM Image Preview Node
 # =====================================================================
 
-class VHS_ImagePreviewRAM:
+class ImagePreviewRAM:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -880,19 +882,9 @@ class VHS_ImagePreviewRAM:
         return {"ui": {"ram_preview": output_files}}
 
 
-import os
-import io
-import av
-import fractions
-import torch
-import numpy as np
-from PIL import Image
-
-import folder_paths
-from comfy.utils import ProgressBar
-from .logger import logger
-from .utils import floatOrInt, imageOrLatent
-
+# =====================================================================
+# 3. Synchronized Video Combine Node
+# =====================================================================
 
 class VideoCombine:
     @classmethod
@@ -912,7 +904,6 @@ class VideoCombine:
                 "meta_batch": ("VHS_BatchManager",),
                 "vae": ("VAE",),
             },
-            # Explicitly declare hidden inputs so ComfyUI injects them
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
@@ -938,14 +929,10 @@ class VideoCombine:
         save_output=True,
         audio=None,
         vae=None,
-        prompt=None,             # <-- Injected via hidden["prompt"]
-        extra_pnginfo=None,      # <-- Injected via hidden["extra_pnginfo"]
+        prompt=None,
+        extra_pnginfo=None,
         **kwargs,
     ):
-        from .nodes import encrypt_buffer_for_browser
-        # Fallback to kwargs in case ComfyUI passes them as generic keyword args
-        prompt = prompt or kwargs.get("prompt")
-        extra_pnginfo = extra_pnginfo or kwargs.get("extra_pnginfo")
         browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
 
         if latents is not None:
@@ -953,7 +940,7 @@ class VideoCombine:
         if images is None:
             return ((save_output, []),)
 
-        # 1. Decode Latents in RAM if VAE is provided
+        # 1. Decode Latents in RAM
         if vae is not None:
             if isinstance(images, dict) and "samples" in images:
                 images = vae.decode(images["samples"])
@@ -968,24 +955,24 @@ class VideoCombine:
         if not isinstance(images, torch.Tensor) or images.size(0) == 0:
             return ((save_output, []),)
 
+        # Handle pingpong sequence
         if pingpong and images.size(0) > 2:
             rev_frames = images[1:-1].flip(dims=[0])
             images = torch.cat([images, rev_frames], dim=0)
 
         num_frames = images.size(0)
-        pbar = ProgressBar(num_frames)
+        fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
+        total_duration = num_frames / fps_float
 
-        # Convert to numpy uint8 RGB in RAM
+        pbar = ProgressBar(num_frames)
         frames_np = np.clip(255.0 * images.detach().cpu().numpy(), 0, 255).astype(np.uint8)
         if frames_np.shape[-1] == 4:
             frames_np = frames_np[..., :3]
 
         height, width = frames_np.shape[1], frames_np.shape[2]
-        fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
-
-        # 2. In-Memory Video & Audio Encoding
         bio = io.BytesIO()
 
+        # 2. Encode Visual Formats
         if format == "image/gif":
             mime_type = "image/gif"
             pil_frames = [Image.fromarray(f) for f in frames_np]
@@ -1009,7 +996,6 @@ class VideoCombine:
                 append_images=pil_frames[1:],
                 duration=max(1, int(round(1000 / fps_float))),
                 loop=loop_count,
-                lossless=kwargs.get("lossless", True),
             )
             pbar.update(num_frames)
 
@@ -1026,6 +1012,7 @@ class VideoCombine:
 
             container = av.open(bio, mode="w", format=container_fmt)
             fps_frac = fractions.Fraction(str(fps_float)).limit_denominator(1001)
+
             v_stream = container.add_stream(video_codec, rate=fps_frac)
             v_stream.width = width
             v_stream.height = height
@@ -1033,7 +1020,7 @@ class VideoCombine:
             if not is_webm:
                 v_stream.options = {"crf": "20", "preset": "fast", "movflags": "+faststart"}
 
-            # Audio multiplexing
+            # Setup Synchronized Audio Stream
             a_stream, resampler, raw_aframe = None, None, None
             if audio is not None and isinstance(audio, dict) and "waveform" in audio:
                 try:
@@ -1041,15 +1028,20 @@ class VideoCombine:
                     a_sr = int(audio.get("sample_rate", 44100))
                     if a_wave.ndim == 3:
                         a_wave = a_wave.squeeze(0)
+
                     ch = min(2, a_wave.shape[0])
                     a_wave = a_wave[:ch]
 
-                    max_samples = int((num_frames / fps_float) * a_sr)
-                    if a_wave.shape[1] > max_samples:
-                        a_wave = a_wave[:, :max_samples]
+                    # Clamp or pad audio to exact total video duration
+                    target_samples = int(round(total_duration * a_sr))
+                    if a_wave.shape[1] > target_samples:
+                        a_wave = a_wave[:, :target_samples]
+                    elif a_wave.shape[1] < target_samples:
+                        pad = torch.zeros((ch, target_samples - a_wave.shape[1]), dtype=a_wave.dtype)
+                        a_wave = torch.cat([a_wave, pad], dim=1)
 
                     a_codec = "libopus" if is_webm else "aac"
-                    target_rate = 48000 if is_webm else a_sr
+                    target_rate = 48000 if is_webm else (a_sr if a_sr in (44100, 48000) else 44100)
                     a_stream = container.add_stream(a_codec, rate=target_rate)
                     layout = "stereo" if ch == 2 else "mono"
 
@@ -1062,11 +1054,13 @@ class VideoCombine:
                     raw_aframe = av.AudioFrame.from_ndarray(a_wave.numpy(), format="fltp", layout=layout)
                     raw_aframe.sample_rate = a_sr
                 except Exception as e:
-                    logger.warn(f"[VideoCombine] Audio setup error: {e}")
+                    logger.warn(f"[VideoCombine] Audio init error: {e}")
                     a_stream = None
 
-            for f in frames_np:
+            # Video Encoding with Monotonic PTS
+            for i, f in enumerate(frames_np):
                 v_frame = av.VideoFrame.from_ndarray(f, format="rgb24")
+                v_frame.pts = i
                 for packet in v_stream.encode(v_frame):
                     container.mux(packet)
                 pbar.update(1)
@@ -1074,12 +1068,18 @@ class VideoCombine:
             for packet in v_stream.encode():
                 container.mux(packet)
 
+            # Audio Encoding with Explicit Sample PTS
             if a_stream is not None and resampler is not None:
                 try:
+                    audio_pts = 0
                     for rframe in resampler.resample(raw_aframe):
+                        rframe.pts = audio_pts
+                        audio_pts += rframe.samples
                         for packet in a_stream.encode(rframe):
                             container.mux(packet)
                     for rframe in resampler.resample(None):
+                        rframe.pts = audio_pts
+                        audio_pts += rframe.samples
                         for packet in a_stream.encode(rframe):
                             container.mux(packet)
                     for packet in a_stream.encode():
@@ -1089,7 +1089,7 @@ class VideoCombine:
 
             container.close()
 
-        # 3. Encrypt in RAM & Zero-out Plaintext Buffer
+        # 3. Encrypt in RAM & Zero Plaintext
         plaintext_buf = bytearray(bio.getvalue())
         bio.close()
 
@@ -1099,7 +1099,7 @@ class VideoCombine:
             plaintext_buf[:] = b"\x00" * len(plaintext_buf)
             del plaintext_buf
 
-        # 4. Save Only Encrypted .bin File to Disk
+        # 4. Save Only Encrypted .bin File
         output_dir = (
             folder_paths.get_output_directory()
             if save_output
@@ -1116,7 +1116,6 @@ class VideoCombine:
         with open(bin_path, "wb") as f:
             f.write(encrypted_payload)
 
-        # 5. Return Output
         preview_item = {
             "filename": bin_filename,
             "subfolder": subfolder,
