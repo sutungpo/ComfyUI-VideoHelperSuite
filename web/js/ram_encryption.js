@@ -360,26 +360,29 @@ app.registerExtension({
         if (isLoadVideo) {
             const nativeWidget = node.widgets?.find(w => w.name === "native_enable");
             if (nativeWidget) {
-                const syncOutputs = (isNative) => {
-                    const isVideoMode = Boolean(isNative);
-
+                const syncOutputs = () => {
+                    const isVideoMode = Boolean(nativeWidget.value);
                     if (!node.outputs || node.outputs.length === 0) return;
 
                     if (isVideoMode) {
-                        // Disconnect auxiliary outputs (1, 2, 3)
+                        // Disconnect and remove extra outputs (1, 2, 3)
                         for (let i = node.outputs.length - 1; i >= 1; i--) {
                             node.disconnectOutput(i);
                             node.removeOutput(i);
                         }
-                        // Change Slot 0 to VIDEO
-                        node.outputs[0].name = "video";
+                        // Change Slot 0 to VIDEO (both name and label)
+                        node.outputs[0].name = "VIDEO";
+                        node.outputs[0].label = "VIDEO";
                         node.outputs[0].type = "VIDEO";
+                        if (node.outputs[0].localized_name) node.outputs[0].localized_name = "VIDEO";
                     } else {
-                        // Change Slot 0 to IMAGE
+                        // Restore Slot 0 to IMAGE
                         node.outputs[0].name = "IMAGE";
+                        node.outputs[0].label = "IMAGE";
                         node.outputs[0].type = "IMAGE";
+                        if (node.outputs[0].localized_name) node.outputs[0].localized_name = "IMAGE";
 
-                        // Restore auxiliary outputs if missing
+                        // Restore extra outputs (1, 2, 3)
                         const expected = [
                             { name: "frame_count", type: "INT" },
                             { name: "audio", type: "AUDIO" },
@@ -392,23 +395,26 @@ app.registerExtension({
                                 node.addOutput(expected[i].name, expected[i].type);
                             } else {
                                 node.outputs[targetIdx].name = expected[i].name;
+                                node.outputs[targetIdx].label = expected[i].name;
                                 node.outputs[targetIdx].type = expected[i].type;
                             }
                         }
                     }
 
                     node.setSize(node.computeSize());
+                    node.setDirtyCanvas?.(true, true);
                     app.graph?.setDirtyCanvas(true, true);
                 };
 
                 const origCallback = nativeWidget.callback;
-                nativeWidget.callback = function (val) {
+                nativeWidget.callback = function () {
                     origCallback?.apply(this, arguments);
-                    syncOutputs(val);
+                    syncOutputs();
                 };
 
-                // Sync slot types on initial node load
-                setTimeout(() => syncOutputs(nativeWidget.value), 20);
+                // Sync on load
+                syncOutputs();
+                setTimeout(syncOutputs, 20);
             }
         }
     }
