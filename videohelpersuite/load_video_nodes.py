@@ -461,8 +461,8 @@ class LoadVideoUpload:
         }
 
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-    RETURN_TYPES = ("VIDEO,IMAGE", "INT", "AUDIO", "VHS_VIDEOINFO")
-    RETURN_NAMES = ("video", "frame_count", "audio", "video_info")
+    RETURN_TYPES = ("IMAGE,VIDEO", "INT", "AUDIO", "VHS_VIDEOINFO")
+    RETURN_NAMES = ("IMAGE", "frame_count", "audio", "video_info")
     FUNCTION = "load_video"
 
     def load_video(self, video: str, native_enable=False, force_rate=0, custom_width=0, custom_height=0,
