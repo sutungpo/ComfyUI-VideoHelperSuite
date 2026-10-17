@@ -28,7 +28,7 @@ async function ensureBrowserKeys() {
     return browserPublicKeyPEM;
 }
 
-// --- Preview & Node Sizing Helpers ---
+// --- Preview & Sizing Helpers ---
 function resizeNodeForMedia(node, width, height) {
     if (!width || !height) return;
     const minWidth = Math.max(node.size[0] || 0, 260);
@@ -86,7 +86,7 @@ function handleFileUpload(node, isImage, uploadBtn) {
         if (!input.files?.length) return;
         const file = input.files[0];
 
-        // 1. Instant local preview
+        // 1. Instant local preview directly from browser memory
         if (isImage) {
             const img = new Image();
             img.onload = () => {
@@ -153,8 +153,7 @@ function handleFileUpload(node, isImage, uploadBtn) {
             if (!res.ok) throw new Error(`Server returned status ${res.status}`);
             const data = await res.json();
 
-            // 4. Update widget value so ComfyUI passes filename to Python
-            // DO NOT call targetWidget.callback() here — that invites VHS to overwrite local preview
+            // 4. Update the target widget value only (no server callback invocation)
             const targetWidgetName = isImage ? "image" : "video";
             const targetWidget = node.widgets?.find(w => w.name === targetWidgetName);
             if (targetWidget) {
@@ -272,7 +271,6 @@ app.registerExtension({
     nodeCreated(node) {
         const isImage = (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM");
         const isLoadVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
-        const isVideoCombine = (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine");
 
         // Clean up blob URLs when node is removed
         const origOnRemoved = node.onRemoved;
@@ -283,81 +281,17 @@ app.registerExtension({
             }
         };
 
-        // 1. Guard against VHS requesting raw ciphertext via updateParameters
-        if ((isLoadVideo || isVideoCombine) && node.updateParameters) {
-            const origUpdate = node.updateParameters;
-            node.updateParameters = function (params) {
-                if (params?.filename?.endsWith(".bin")) return;
-                return origUpdate.apply(this, arguments);
-            };
-        }
-
-        // 2. Guard against VHS replacing working preview with remote .bin via updateSource
-        if (isLoadVideo || isVideoCombine) {
-            const previewWidget = node.widgets?.find(w => w.name === "videopreview");
-            if (previewWidget && previewWidget.updateSource) {
-                const origUpdateSource = previewWidget.updateSource;
-                previewWidget.updateSource = function () {
-                    const currentFile = node.widgets?.find(w => w.name === "video")?.value;
-                    if (currentFile?.endsWith(".bin")) return;
-                    return origUpdateSource.apply(this, arguments);
-                };
-            }
-        }
-
-        // 3. Extra context menu options for saving decrypted media
-        const origGetExtraMenuOptions = node.getExtraMenuOptions;
-        node.getExtraMenuOptions = function (canvas, options) {
-            origGetExtraMenuOptions?.apply(this, arguments);
-            if (this.decryptedMedia?.blobUrl) {
-                const { blobUrl, filename, format } = this.decryptedMedia;
-                if (!options.some(opt => opt?.content === "Save preview")) {
-                    options.unshift(
-                        {
-                            content: "Save preview",
-                            callback: () => {
-                                const a = document.createElement("a");
-                                a.href = blobUrl;
-                                const ext = format?.startsWith("video/") ? ".mp4" : ".png";
-                                a.download = (filename || "preview").replace(/\.bin$/, ext);
-                                document.body.appendChild(a);
-                                a.click();
-                                requestAnimationFrame(() => a.remove());
-                            }
-                        },
-                        {
-                            content: "Open preview",
-                            callback: () => { window.open(blobUrl, "_blank"); }
-                        }
-                    );
-                }
-            }
-        };
-
-        // 4. Upload button setup for input nodes
-        if (isImage || isLoadVideo) {
-            // For ImageUploadRAM: Hide the "image" input widget completely from the canvas
-            if (isImage) {
-                let imgWidget = node.widgets?.find(w => w.name === "image");
-                if (!imgWidget) {
-                    imgWidget = node.addWidget("text", "image", "", () => {}, { serialize: true });
-                }
-                imgWidget.type = "hidden";
-                imgWidget.computeSize = () => [0, -4];
-            }
-
-            // Always guarantee the upload button exists with the proper handler attached
-            let uploadBtn = node.widgets?.find(w => w.name === "upload");
-            if (!uploadBtn) {
-                uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {});
-            }
-            uploadBtn.serialize = false;
-            uploadBtn.label = "Upload & Encrypt (.bin)";
-            uploadBtn.callback = () => handleFileUpload(node, isImage, uploadBtn);
-        }
-
-        // Dynamic output slot switcher for LoadVideoUpload
+        // Decouple LoadVideo from VHS remote server preview calls entirely
         if (isLoadVideo) {
+            if (node.updateParameters) {
+                node.updateParameters = function () {};
+            }
+            const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+            if (previewWidget) {
+                previewWidget.updateSource = function () {};
+            }
+
+            // Synchronize output sockets for native_enable toggle
             const nativeWidget = node.widgets?.find(w => w.name === "native_enable");
             if (nativeWidget) {
                 const syncOutputs = () => {
@@ -365,24 +299,20 @@ app.registerExtension({
                     if (!node.outputs || node.outputs.length === 0) return;
 
                     if (isVideoMode) {
-                        // Disconnect and remove extra outputs (1, 2, 3)
                         for (let i = node.outputs.length - 1; i >= 1; i--) {
                             node.disconnectOutput(i);
                             node.removeOutput(i);
                         }
-                        // Change Slot 0 to VIDEO (both name and label)
                         node.outputs[0].name = "VIDEO";
                         node.outputs[0].label = "VIDEO";
                         node.outputs[0].type = "VIDEO";
                         if (node.outputs[0].localized_name) node.outputs[0].localized_name = "VIDEO";
                     } else {
-                        // Restore Slot 0 to IMAGE
                         node.outputs[0].name = "IMAGE";
                         node.outputs[0].label = "IMAGE";
                         node.outputs[0].type = "IMAGE";
                         if (node.outputs[0].localized_name) node.outputs[0].localized_name = "IMAGE";
 
-                        // Restore extra outputs (1, 2, 3)
                         const expected = [
                             { name: "frame_count", type: "INT" },
                             { name: "audio", type: "AUDIO" },
@@ -412,10 +342,59 @@ app.registerExtension({
                     syncOutputs();
                 };
 
-                // Sync on load
                 syncOutputs();
                 setTimeout(syncOutputs, 20);
             }
+        }
+
+        // Context menu options for saving decrypted media
+        const origGetExtraMenuOptions = node.getExtraMenuOptions;
+        node.getExtraMenuOptions = function (canvas, options) {
+            origGetExtraMenuOptions?.apply(this, arguments);
+            if (this.decryptedMedia?.blobUrl) {
+                const { blobUrl, filename, format } = this.decryptedMedia;
+                if (!options.some(opt => opt?.content === "Save preview")) {
+                    options.unshift(
+                        {
+                            content: "Save preview",
+                            callback: () => {
+                                const a = document.createElement("a");
+                                a.href = blobUrl;
+                                const ext = format?.startsWith("video/") ? ".mp4" : ".png";
+                                a.download = (filename || "preview").replace(/\.bin$/, ext);
+                                document.body.appendChild(a);
+                                a.click();
+                                requestAnimationFrame(() => a.remove());
+                            }
+                        },
+                        {
+                            content: "Open preview",
+                            callback: () => { window.open(blobUrl, "_blank"); }
+                        }
+                    );
+                }
+            }
+        };
+
+        // Upload button setup for input nodes
+        if (isImage || isLoadVideo) {
+            // For ImageUploadRAM: Hide the "image" input widget completely from the canvas
+            if (isImage) {
+                let imgWidget = node.widgets?.find(w => w.name === "image");
+                if (!imgWidget) {
+                    imgWidget = node.addWidget("text", "image", "", () => {}, { serialize: true });
+                }
+                imgWidget.type = "hidden";
+                imgWidget.computeSize = () => [0, -4];
+            }
+
+            let uploadBtn = node.widgets?.find(w => w.name === "upload");
+            if (!uploadBtn) {
+                uploadBtn = node.addWidget("button", "upload", "Upload & Encrypt (.bin)", () => {});
+            }
+            uploadBtn.serialize = false;
+            uploadBtn.label = "Upload & Encrypt (.bin)";
+            uploadBtn.callback = () => handleFileUpload(node, isImage, uploadBtn);
         }
     }
 });
