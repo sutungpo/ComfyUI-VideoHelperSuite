@@ -261,10 +261,18 @@ app.registerExtension({
     },
 
     beforeRegisterNodeDef(nodeType, nodeData) {
+        // Allow upload button on input nodes
         if (nodeData.name === "VHS_ImageUploadRAM" || nodeData.name === "VHS_LoadVideo") {
             nodeData.input = nodeData.input || {};
             nodeData.input.optional = nodeData.input.optional || {};
             nodeData.input.optional["upload"] = ["BUTTON", {}];
+        }
+
+        // Allow refresh_preview button on preview/output nodes so VHS core does not crash
+        if (nodeData.name === "VHS_ImagePreviewRAM" || nodeData.name === "VHS_VideoCombine") {
+            nodeData.input = nodeData.input || {};
+            nodeData.input.optional = nodeData.input.optional || {};
+            nodeData.input.optional["refresh_preview"] = ["BUTTON", {}];
         }
     },
 
@@ -348,25 +356,27 @@ app.registerExtension({
         if (isImagePreview || isVideoCombine) {
             let refreshBtn = node.widgets?.find(w => w.name === "refresh_preview");
             if (!refreshBtn) {
-                refreshBtn = node.addWidget("button", "refresh_preview", "Refresh Preview", async () => {
-                    const item = node.ramPreviewItem || node.properties?.["last_ram_preview"];
-                    if (!item) {
-                        alert("No generated preview found for this node yet.");
-                        return;
-                    }
-                    refreshBtn.label = "Decrypting...";
-                    node.setDirtyCanvas(true);
-                    try {
-                        await renderDecryptedPreview(node, item);
-                    } catch (err) {
-                        alert("Refresh failed: " + err.message);
-                    } finally {
-                        refreshBtn.label = "Refresh Preview";
-                        node.setDirtyCanvas(true);
-                    }
-                });
-                refreshBtn.serialize = false;
+                refreshBtn = node.addWidget("button", "refresh_preview", "Refresh Preview", () => {});
             }
+            refreshBtn.serialize = false;
+            refreshBtn.label = "Refresh Preview";
+            refreshBtn.callback = async () => {
+                const item = node.ramPreviewItem || node.properties?.["last_ram_preview"];
+                if (!item) {
+                    alert("No generated preview found for this node yet.");
+                    return;
+                }
+                refreshBtn.label = "Decrypting...";
+                node.setDirtyCanvas(true);
+                try {
+                    await renderDecryptedPreview(node, item);
+                } catch (err) {
+                    alert("Refresh failed: " + err.message);
+                } finally {
+                    refreshBtn.label = "Refresh Preview";
+                    node.setDirtyCanvas(true);
+                }
+            };
         }
 
         // Context menu options for saving decrypted media
