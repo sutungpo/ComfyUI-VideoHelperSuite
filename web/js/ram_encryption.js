@@ -86,14 +86,15 @@ async function renderDecryptedPreview(node, item) {
 
     if (isVideo && previewWidget?.videoEl) {
         previewWidget.videoEl.src = blobUrl;
+
+        // Force container visible (fixes old workflows that locked it to hidden)
+        if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
         previewWidget.videoEl.hidden = false;
         if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
-        if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+        if (previewWidget.value) previewWidget.value.hidden = false;
 
-        previewWidget.value = previewWidget.value || {};
-        previewWidget.value.hidden = false;
         previewWidget.videoEl.loop = true;
-        previewWidget.videoEl.muted = previewWidget.value.muted ?? true;
+        previewWidget.videoEl.muted = previewWidget.value?.muted ?? true;
         previewWidget.videoEl.autoplay = true;
 
         previewWidget.videoEl.onloadedmetadata = () => {
