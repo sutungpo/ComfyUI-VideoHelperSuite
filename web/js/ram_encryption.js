@@ -76,6 +76,55 @@ async function resolveEncryptedBlobUrl(item) {
     return URL.createObjectURL(new Blob([decrypted], { type: item.format || "application/octet-stream" }));
 }
 
+// --- Unified Decrypt & Render Function ---
+async function renderDecryptedPreview(node, item) {
+    const blobUrl = await resolveEncryptedBlobUrl(item);
+    const isVideo = item.format?.startsWith("video/") || item.format === "image/gif";
+    const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+
+    setDecryptedMedia(node, blobUrl, item.filename, item.format);
+
+    if (isVideo && previewWidget?.videoEl) {
+        previewWidget.videoEl.src = blobUrl;
+        previewWidget.videoEl.hidden = false;
+        if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
+        if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+
+        previewWidget.value = previewWidget.value || {};
+        previewWidget.value.hidden = false;
+        previewWidget.videoEl.loop = true;
+        previewWidget.videoEl.muted = previewWidget.value.muted ?? true;
+        previewWidget.videoEl.autoplay = true;
+
+        previewWidget.videoEl.onloadedmetadata = () => {
+            previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
+            resizeNodeForMedia(node, previewWidget.videoEl.videoWidth, previewWidget.videoEl.videoHeight);
+        };
+
+        await previewWidget.videoEl.play().catch(() => {});
+    } else if (item.format === "image/webp" && previewWidget?.imgEl) {
+        previewWidget.imgEl.src = blobUrl;
+        previewWidget.imgEl.hidden = false;
+        if (previewWidget.videoEl) previewWidget.videoEl.hidden = true;
+        if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
+
+        previewWidget.imgEl.onload = () => {
+            previewWidget.aspectRatio = previewWidget.imgEl.naturalWidth / previewWidget.imgEl.naturalHeight;
+            resizeNodeForMedia(node, previewWidget.imgEl.naturalWidth, previewWidget.imgEl.naturalHeight);
+        };
+    } else {
+        const img = new Image();
+        await new Promise(r => { img.onload = r; img.onerror = r; img.src = blobUrl; });
+        node.imgs = [img];
+        if (img.naturalWidth) {
+            resizeNodeForMedia(node, img.naturalWidth, img.naturalHeight);
+        }
+    }
+
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas(true, true);
+}
+
 // --- Upload & Local Encrypt Handler ---
 function handleFileUpload(node, isImage, uploadBtn) {
     const input = document.createElement("input");
@@ -86,7 +135,6 @@ function handleFileUpload(node, isImage, uploadBtn) {
         if (!input.files?.length) return;
         const file = input.files[0];
 
-        // 1. Instant local preview directly from browser memory
         if (isImage) {
             const img = new Image();
             img.onload = () => {
@@ -122,7 +170,6 @@ function handleFileUpload(node, isImage, uploadBtn) {
         node.setDirtyCanvas(true);
 
         try {
-            // 2. Encrypt locally in browser RAM
             const keyRes = await fetch("/crypto/server_pubkey");
             if (!keyRes.ok) throw new Error("Could not fetch server public key");
             const serverKey = await window.crypto.subtle.importKey(
@@ -144,7 +191,6 @@ function handleFileUpload(node, isImage, uploadBtn) {
             payload.set(iv, 256);
             payload.set(new Uint8Array(ciphertext), 268);
 
-            // 3. Upload only encrypted .bin payload
             const formData = new FormData();
             formData.append("image", new Blob([payload]), `${file.name.replace(/\.[^/.]+$/, "")}_${Date.now()}.bin`);
             formData.append("overwrite", "true");
@@ -153,7 +199,6 @@ function handleFileUpload(node, isImage, uploadBtn) {
             if (!res.ok) throw new Error(`Server returned status ${res.status}`);
             const data = await res.json();
 
-            // 4. Update the target widget value only (no server callback invocation)
             const targetWidgetName = isImage ? "image" : "video";
             const targetWidget = node.widgets?.find(w => w.name === targetWidgetName);
             if (targetWidget) {
@@ -182,7 +227,6 @@ app.registerExtension({
     async setup() {
         await ensureBrowserKeys();
 
-        // Inject browser public key into prompt workflow metadata
         const origGraphToPrompt = app.graphToPrompt;
         app.graphToPrompt = async function () {
             const res = await origGraphToPrompt.apply(this, arguments);
@@ -194,7 +238,7 @@ app.registerExtension({
             return res;
         };
 
-        // Decrypt and display output previews locally on execution
+        // Decrypt and display previews on execution completion
         api.addEventListener("executed", async ({ detail }) => {
             const items = detail?.output?.ram_preview;
             if (!items?.length) return;
@@ -204,56 +248,12 @@ app.registerExtension({
 
             try {
                 const item = items[0];
-                const blobUrl = await resolveEncryptedBlobUrl(item);
-                const isVideo = item.format?.startsWith("video/") || item.format === "image/gif";
-                const previewWidget = node.widgets?.find(w => w.name === "videopreview");
+                // Save preview metadata into node state for the refresh button
+                node.ramPreviewItem = item;
+                node.properties = node.properties || {};
+                node.properties["last_ram_preview"] = item;
 
-                setDecryptedMedia(node, blobUrl, item.filename, item.format);
-
-                if (isVideo && previewWidget?.videoEl) {
-                    previewWidget.videoEl.src = blobUrl;
-                    previewWidget.videoEl.hidden = false;
-                    if (previewWidget.imgEl) previewWidget.imgEl.hidden = true;
-                    if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
-
-                    previewWidget.value = previewWidget.value || {};
-                    previewWidget.value.hidden = false;
-                    previewWidget.videoEl.loop = true;
-                    previewWidget.videoEl.muted = previewWidget.value.muted ?? true;
-                    previewWidget.videoEl.autoplay = true;
-
-                    previewWidget.videoEl.onloadedmetadata = () => {
-                        previewWidget.aspectRatio = previewWidget.videoEl.videoWidth / previewWidget.videoEl.videoHeight;
-                        resizeNodeForMedia(node, previewWidget.videoEl.videoWidth, previewWidget.videoEl.videoHeight);
-                    };
-
-                    await previewWidget.videoEl.play().catch(() => {});
-                } else if (item.format === "image/webp" && previewWidget?.imgEl) {
-                    previewWidget.imgEl.src = blobUrl;
-                    previewWidget.imgEl.hidden = false;
-                    if (previewWidget.videoEl) previewWidget.videoEl.hidden = true;
-                    if (previewWidget.parentEl) previewWidget.parentEl.hidden = false;
-
-                    previewWidget.imgEl.onload = () => {
-                        previewWidget.aspectRatio = previewWidget.imgEl.naturalWidth / previewWidget.imgEl.naturalHeight;
-                        resizeNodeForMedia(node, previewWidget.imgEl.naturalWidth, previewWidget.imgEl.naturalHeight);
-                    };
-                } else {
-                    const loadedImgs = [];
-                    for (const it of items) {
-                        const bUrl = (it === item) ? blobUrl : await resolveEncryptedBlobUrl(it);
-                        const img = new Image();
-                        await new Promise(r => { img.onload = r; img.onerror = r; img.src = bUrl; });
-                        loadedImgs.push(img);
-                    }
-                    node.imgs = loadedImgs;
-                    if (loadedImgs[0]?.naturalWidth) {
-                        resizeNodeForMedia(node, loadedImgs[0].naturalWidth, loadedImgs[0].naturalHeight);
-                    }
-                }
-
-                node.setDirtyCanvas?.(true, true);
-                app.graph.setDirtyCanvas(true, true);
+                await renderDecryptedPreview(node, item);
             } catch (err) {
                 console.error("[RAM Encryption] Decryption render error:", err);
             }
@@ -271,6 +271,8 @@ app.registerExtension({
     nodeCreated(node) {
         const isImage = (node.comfyClass === "VHS_ImageUploadRAM" || node.type === "VHS_ImageUploadRAM");
         const isLoadVideo = (node.comfyClass === "VHS_LoadVideo" || node.type === "VHS_LoadVideo");
+        const isImagePreview = (node.comfyClass === "VHS_ImagePreviewRAM" || node.type === "VHS_ImagePreviewRAM");
+        const isVideoCombine = (node.comfyClass === "VHS_VideoCombine" || node.type === "VHS_VideoCombine");
 
         // Clean up blob URLs when node is removed
         const origOnRemoved = node.onRemoved;
@@ -281,17 +283,12 @@ app.registerExtension({
             }
         };
 
-        // Decouple LoadVideo from VHS remote server preview calls entirely
+        // Decouple LoadVideo from VHS remote server preview calls
         if (isLoadVideo) {
-            if (node.updateParameters) {
-                node.updateParameters = function () {};
-            }
+            if (node.updateParameters) node.updateParameters = function () {};
             const previewWidget = node.widgets?.find(w => w.name === "videopreview");
-            if (previewWidget) {
-                previewWidget.updateSource = function () {};
-            }
+            if (previewWidget) previewWidget.updateSource = function () {};
 
-            // Synchronize output sockets for native_enable toggle
             const nativeWidget = node.widgets?.find(w => w.name === "native_enable");
             if (nativeWidget) {
                 const syncOutputs = () => {
@@ -347,6 +344,31 @@ app.registerExtension({
             }
         }
 
+        // --- Uniform Refresh Button for ImagePreview and VideoCombine ---
+        if (isImagePreview || isVideoCombine) {
+            let refreshBtn = node.widgets?.find(w => w.name === "refresh_preview");
+            if (!refreshBtn) {
+                refreshBtn = node.addWidget("button", "refresh_preview", "Refresh Preview", async () => {
+                    const item = node.ramPreviewItem || node.properties?.["last_ram_preview"];
+                    if (!item) {
+                        alert("No generated preview found for this node yet.");
+                        return;
+                    }
+                    refreshBtn.label = "Decrypting...";
+                    node.setDirtyCanvas(true);
+                    try {
+                        await renderDecryptedPreview(node, item);
+                    } catch (err) {
+                        alert("Refresh failed: " + err.message);
+                    } finally {
+                        refreshBtn.label = "Refresh Preview";
+                        node.setDirtyCanvas(true);
+                    }
+                });
+                refreshBtn.serialize = false;
+            }
+        }
+
         // Context menu options for saving decrypted media
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
@@ -378,7 +400,6 @@ app.registerExtension({
 
         // Upload button setup for input nodes
         if (isImage || isLoadVideo) {
-            // For ImageUploadRAM: Hide the "image" input widget completely from the canvas
             if (isImage) {
                 let imgWidget = node.widgets?.find(w => w.name === "image");
                 if (!imgWidget) {
