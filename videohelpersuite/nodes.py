@@ -885,7 +885,7 @@ class VHS_ImagePreviewRAM:
 # =====================================================================
 # 3. Synchronized Video Combine Node
 # =====================================================================
-
+import gc
 class VideoCombine:
     @classmethod
     def INPUT_TYPES(s):
@@ -933,19 +933,29 @@ class VideoCombine:
         extra_pnginfo=None,
         **kwargs,
     ):
+        # 1. System RAM & Device Cleanup at Node Entry
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         if latents is not None:
             images = latents
         if images is None:
             logger.warn("[VideoCombine] No images provided.")
             return ((save_output, []),)
 
-        plaintext_buf = None
-        try:
-            # 1. Multi-GPU Sync & Safe CPU Collection
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+        bio = io.BytesIO()
+        plaintext_view = None
 
-            if isinstance(images, (list, tuple)):
+        try:
+            # 2. Device-Agnostic Input Normalization: Pull 100% to CPU System RAM
+            if isinstance(images, dict) and "samples" in images:
+                if vae is not None:
+                    vae_dev = getattr(vae, "device", None) or getattr(vae, "load_device", None) or torch.device("cpu")
+                    images = vae.decode(images["samples"].to(vae_dev)).detach().to("cpu")
+                else:
+                    raise ValueError("[VideoCombine] Latents received but no VAE provided to decode.")
+            elif isinstance(images, (list, tuple)):
                 cpu_chunks = []
                 for idx, chunk in enumerate(images):
                     if isinstance(chunk, torch.Tensor):
@@ -959,70 +969,72 @@ class VideoCombine:
                     logger.error("[VideoCombine] Empty image sequence after parsing chunks.")
                     return ((save_output, []),)
                 images = torch.cat(cpu_chunks, dim=0)
+                del cpu_chunks
             elif isinstance(images, torch.Tensor):
                 images = images.detach().to("cpu")
                 if images.ndim == 3:
                     images = images.unsqueeze(0)
-            elif isinstance(images, dict) and "samples" in images:
-                if vae is not None:
-                    vae_dev = getattr(vae, "device", None) or getattr(vae, "load_device", None) or torch.device("cpu")
-                    images = vae.decode(images["samples"].to(vae_dev)).detach().to("cpu")
-                else:
-                    raise ValueError("[VideoCombine] Latents received but no VAE provided to decode.")
 
-            # 2. Sequence Adjustments & Format Normalization
-            if pingpong and images.size(0) > 2:
-                images = torch.cat([images, images[1:-1].flip(dims=[0])], dim=0)
+            # 3. Quality-Preserving Quantization: Mathematically Exact Rounding Math
+            # Uses round(x * 255.0) instead of truncating cast to preserve full sRGB/BT.709 color fidelity
+            # No in-place mutation: original input tensors remain completely untouched upstream
+            images_u8 = torch.round(images.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+            del images
+            gc.collect()
 
-            num_frames = images.size(0)
+            # Sequence adjustments
+            if pingpong and images_u8.size(0) > 2:
+                images_u8 = torch.cat([images_u8, images_u8[1:-1].flip(dims=[0])], dim=0)
+
+            num_frames = images_u8.size(0)
             fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
             total_duration = num_frames / fps_float
 
-            # Convert to uint8 NumPy array safely
-            frames_np = (images.clamp(0.0, 1.0) * 255.0).to(torch.uint8).numpy()
-            del images
-
-            if frames_np.shape[-1] == 4:
-                frames_np = frames_np[..., :3]
-
-            height, width = frames_np.shape[1], frames_np.shape[2]
-            if width % 2 != 0 or height % 2 != 0:
-                width -= width % 2
-                height -= height % 2
-                frames_np = frames_np[:, :height, :width, :]
-
-            # Force C-contiguous memory layout (prevents native libswscale SIGSEGV)
-            frames_np = np.ascontiguousarray(frames_np)
+            # Lossless 1-pixel boundary crop for odd codec alignments (no interpolation blur)
+            orig_h, orig_w = images_u8.shape[1], images_u8.shape[2]
+            height = orig_h - (orig_h % 2)
+            width = orig_w - (orig_w % 2)
 
             pbar = ProgressBar(num_frames)
-            bio = io.BytesIO()
 
-            # 3. Encoding (GIF / WebP / MP4 / WebM)
+            # 4. In-RAM Encoding via On-The-Fly Per-Frame Slicing
             if format == "image/gif":
                 mime_type = "image/gif"
-                pil_frames = [Image.fromarray(f) for f in frames_np]
-                pil_frames[0].save(
+                first_frame = Image.fromarray(np.ascontiguousarray(images_u8[0, :height, :width, :3].numpy()))
+
+                def gif_frame_iter():
+                    for i in range(1, num_frames):
+                        pbar.update(1)
+                        yield Image.fromarray(np.ascontiguousarray(images_u8[i, :height, :width, :3].numpy()))
+
+                first_frame.save(
                     bio,
                     format="GIF",
                     save_all=True,
-                    append_images=pil_frames[1:],
+                    append_images=gif_frame_iter(),
                     duration=max(1, int(round(1000 / fps_float))),
                     loop=loop_count,
                 )
-                pbar.update(num_frames)
+                pbar.update(1)
 
             elif format == "image/webp":
                 mime_type = "image/webp"
-                pil_frames = [Image.fromarray(f) for f in frames_np]
-                pil_frames[0].save(
+                first_frame = Image.fromarray(np.ascontiguousarray(images_u8[0, :height, :width, :3].numpy()))
+
+                def webp_frame_iter():
+                    for i in range(1, num_frames):
+                        pbar.update(1)
+                        yield Image.fromarray(np.ascontiguousarray(images_u8[i, :height, :width, :3].numpy()))
+
+                first_frame.save(
                     bio,
                     format="WEBP",
                     save_all=True,
-                    append_images=pil_frames[1:],
+                    append_images=webp_frame_iter(),
                     duration=max(1, int(round(1000 / fps_float))),
                     loop=loop_count,
                 )
-                pbar.update(num_frames)
+                pbar.update(1)
 
             else:
                 is_webm = "webm" in format
@@ -1038,11 +1050,11 @@ class VideoCombine:
                 v_stream.height = height
                 v_stream.pix_fmt = "yuv420p"
 
-                # Keep thread count fixed (prevents thread thrashing/stack crashes with PyTorch OpenMP)
-                # Omit "+faststart" to avoid backward-seek corruption on in-memory BytesIO
+                # Constrained threads to eliminate OpenMP thread pool contention
+                # Omit '+faststart' on in-memory BytesIO to prevent backward-seek corruption
                 v_stream.options = {"crf": "20", "preset": "fast", "threads": "4"}
 
-                # Audio Setup (Safely processed on CPU)
+                # Audio Setup: Processed entirely on CPU preserving 1x duration
                 a_stream, resampler, raw_aframe = None, None, None
                 if audio is not None and isinstance(audio, dict) and "waveform" in audio:
                     try:
@@ -1080,9 +1092,10 @@ class VideoCombine:
                         logger.error(f"[VideoCombine] Audio setup failed, continuing without audio: {a_err}")
                         a_stream, resampler, raw_aframe = None, None, None
 
-                # Encode video frames
-                for i, f in enumerate(frames_np):
-                    v_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(f), format="rgb24")
+                # Video Encoding: Slices single frame on-the-fly (O(1) memory overhead, strictly C-contiguous)
+                for i in range(num_frames):
+                    f_slice = images_u8[i, :height, :width, :3].numpy()
+                    v_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(f_slice), format="rgb24")
                     v_frame.pts = i
                     for packet in v_stream.encode(v_frame):
                         container.mux(packet)
@@ -1091,7 +1104,7 @@ class VideoCombine:
                 for packet in v_stream.encode():
                     container.mux(packet)
 
-                # Encode audio packets
+                # Audio Encoding with Explicit Sample PTS
                 if a_stream is not None and resampler is not None and raw_aframe is not None:
                     try:
                         audio_pts = 0
@@ -1112,22 +1125,54 @@ class VideoCombine:
 
                 container.close()
 
-            # 4. In-RAM Encryption & Secure Storage
+            # Free raw frame buffer immediately before encryption
+            del images_u8
+            del raw_aframe
+            gc.collect()
+
+            # 5. Zero-Copy In-RAM Encryption & Direct Disk Streaming
             browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
-            plaintext_buf = bytearray(bio.getvalue())
-            bio.close()
+            if browser_pubkey is None:
+                raise RuntimeError(
+                    "[RAM Encryption] Browser Public Key not found in workflow metadata. "
+                    "Please make sure the workflow was queued from an active browser tab."
+                )
 
-            encrypted_payload = encrypt_buffer_for_browser(plaintext_buf, browser_pubkey)
+            # Access encoded container memory without duplicating bytearray
+            plaintext_view = bio.getbuffer()
 
+            aes_key = os.urandom(32)
+            iv = os.urandom(12)
+            aesgcm = AESGCM(aes_key)
+            ciphertext = aesgcm.encrypt(iv, plaintext_view, None)
+
+            wrapped_key = browser_pubkey.encrypt(
+                aes_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None,
+                ),
+            )
+            del aes_key
+
+            # Write .bin ciphertext directly without concatenating giant payload in RAM
             output_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
-            full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(filename_prefix, output_dir)
+            full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+                filename_prefix, output_dir
+            )
             os.makedirs(full_output_folder, exist_ok=True)
 
             bin_filename = f"{filename}_{counter:05}.bin"
             bin_path = os.path.join(full_output_folder, bin_filename)
 
             with open(bin_path, "wb") as f:
-                f.write(encrypted_payload)
+                f.write(wrapped_key)
+                f.write(iv)
+                f.write(ciphertext)
+
+            del ciphertext
+            del wrapped_key
 
             preview_item = {
                 "filename": bin_filename,
@@ -1143,14 +1188,16 @@ class VideoCombine:
             }
 
         except Exception as e:
-            logger.error(f"[VideoCombine] Fatal encoding error: {e}", exc_info=True)
+            logger.error(f"[VideoCombine] Fatal error during processing: {e}", exc_info=True)
             raise e
 
         finally:
-            # 5. Mandatory RAM Zeroization
-            if plaintext_buf is not None:
-                plaintext_buf[:] = b"\x00" * len(plaintext_buf)
-                del plaintext_buf
+            # 6. Mandatory RAM Zeroization (agent.md Rule 3)
+            if plaintext_view is not None:
+                plaintext_view[:] = b"\x00" * len(plaintext_view)
+                plaintext_view.release()
+            bio.close()
+            gc.collect()
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
