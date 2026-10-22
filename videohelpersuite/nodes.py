@@ -933,203 +933,224 @@ class VideoCombine:
         extra_pnginfo=None,
         **kwargs,
     ):
-        browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
-
         if latents is not None:
             images = latents
         if images is None:
+            logger.warn("[VideoCombine] No images provided.")
             return ((save_output, []),)
 
-        # 1. Decode Latents in RAM
-        if vae is not None:
-            if isinstance(images, dict) and "samples" in images:
-                images = vae.decode(images["samples"])
-            elif isinstance(images, torch.Tensor) and images.ndim == 4 and images.shape[1] in (4, 8, 16):
-                images = vae.decode(images)
+        plaintext_buf = None
+        try:
+            # 1. Multi-GPU Sync & Safe CPU Collection
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-        if isinstance(images, (list, tuple)):
-            images = torch.cat([img if img.ndim == 4 else img.unsqueeze(0) for img in images], dim=0)
-        elif isinstance(images, torch.Tensor) and images.ndim == 3:
-            images = images.unsqueeze(0)
+            if isinstance(images, (list, tuple)):
+                cpu_chunks = []
+                for idx, chunk in enumerate(images):
+                    if isinstance(chunk, torch.Tensor):
+                        t = chunk.detach().to("cpu")
+                        cpu_chunks.append(t if t.ndim == 4 else t.unsqueeze(0))
+                    elif isinstance(chunk, np.ndarray):
+                        cpu_chunks.append(torch.from_numpy(chunk))
+                    else:
+                        logger.warn(f"[VideoCombine] Skipping unrecognized chunk index {idx}: {type(chunk)}")
+                if not cpu_chunks:
+                    logger.error("[VideoCombine] Empty image sequence after parsing chunks.")
+                    return ((save_output, []),)
+                images = torch.cat(cpu_chunks, dim=0)
+            elif isinstance(images, torch.Tensor):
+                images = images.detach().to("cpu")
+                if images.ndim == 3:
+                    images = images.unsqueeze(0)
+            elif isinstance(images, dict) and "samples" in images:
+                if vae is not None:
+                    vae_dev = getattr(vae, "device", None) or getattr(vae, "load_device", None) or torch.device("cpu")
+                    images = vae.decode(images["samples"].to(vae_dev)).detach().to("cpu")
+                else:
+                    raise ValueError("[VideoCombine] Latents received but no VAE provided to decode.")
 
-        if not isinstance(images, torch.Tensor) or images.size(0) == 0:
-            return ((save_output, []),)
+            # 2. Sequence Adjustments & Format Normalization
+            if pingpong and images.size(0) > 2:
+                images = torch.cat([images, images[1:-1].flip(dims=[0])], dim=0)
 
-        # Handle pingpong sequence
-        if pingpong and images.size(0) > 2:
-            rev_frames = images[1:-1].flip(dims=[0])
-            images = torch.cat([images, rev_frames], dim=0)
+            num_frames = images.size(0)
+            fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
+            total_duration = num_frames / fps_float
 
-        num_frames = images.size(0)
-        fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
-        total_duration = num_frames / fps_float
+            # Convert to uint8 NumPy array safely
+            frames_np = (images.clamp(0.0, 1.0) * 255.0).to(torch.uint8).numpy()
+            del images
 
-        pbar = ProgressBar(num_frames)
-        frames_np = np.clip(255.0 * images.detach().cpu().numpy(), 0, 255).astype(np.uint8)
-        if frames_np.shape[-1] == 4:
-            frames_np = frames_np[..., :3]
+            if frames_np.shape[-1] == 4:
+                frames_np = frames_np[..., :3]
 
-        height, width = frames_np.shape[1], frames_np.shape[2]
-        bio = io.BytesIO()
-
-        # 2. Encode Visual Formats
-        if format == "image/gif":
-            mime_type = "image/gif"
-            pil_frames = [Image.fromarray(f) for f in frames_np]
-            pil_frames[0].save(
-                bio,
-                format="GIF",
-                save_all=True,
-                append_images=pil_frames[1:],
-                duration=max(1, int(round(1000 / fps_float))),
-                loop=loop_count,
-            )
-            pbar.update(num_frames)
-
-        elif format == "image/webp":
-            mime_type = "image/webp"
-            pil_frames = [Image.fromarray(f) for f in frames_np]
-            pil_frames[0].save(
-                bio,
-                format="WEBP",
-                save_all=True,
-                append_images=pil_frames[1:],
-                duration=max(1, int(round(1000 / fps_float))),
-                loop=loop_count,
-            )
-            pbar.update(num_frames)
-
-        else:
-            is_webm = "webm" in format
-            container_fmt = "webm" if is_webm else "mp4"
-            video_codec = "libvpx-vp9" if is_webm else "libx264"
-            mime_type = "video/webm" if is_webm else "video/mp4"
-
+            height, width = frames_np.shape[1], frames_np.shape[2]
             if width % 2 != 0 or height % 2 != 0:
                 width -= width % 2
                 height -= height % 2
                 frames_np = frames_np[:, :height, :width, :]
 
-            container = av.open(bio, mode="w", format=container_fmt)
-            fps_frac = fractions.Fraction(str(fps_float)).limit_denominator(1001)
+            # Force C-contiguous memory layout (prevents native libswscale SIGSEGV)
+            frames_np = np.ascontiguousarray(frames_np)
 
-            v_stream = container.add_stream(video_codec, rate=fps_frac)
-            v_stream.width = width
-            v_stream.height = height
-            v_stream.pix_fmt = "yuv420p"
-            if not is_webm:
-                v_stream.options = {"crf": "20", "preset": "fast", "movflags": "+faststart"}
+            pbar = ProgressBar(num_frames)
+            bio = io.BytesIO()
 
-            # Setup Synchronized Audio Stream
-            a_stream, resampler, raw_aframe = None, None, None
-            if audio is not None and isinstance(audio, dict) and "waveform" in audio:
-                try:
-                    a_wave = audio["waveform"].detach().cpu()
-                    a_sr = int(audio.get("sample_rate", 44100))
-                    if a_wave.ndim == 3:
-                        a_wave = a_wave.squeeze(0)
+            # 3. Encoding (GIF / WebP / MP4 / WebM)
+            if format == "image/gif":
+                mime_type = "image/gif"
+                pil_frames = [Image.fromarray(f) for f in frames_np]
+                pil_frames[0].save(
+                    bio,
+                    format="GIF",
+                    save_all=True,
+                    append_images=pil_frames[1:],
+                    duration=max(1, int(round(1000 / fps_float))),
+                    loop=loop_count,
+                )
+                pbar.update(num_frames)
 
-                    ch = min(2, a_wave.shape[0])
-                    a_wave = a_wave[:ch]
+            elif format == "image/webp":
+                mime_type = "image/webp"
+                pil_frames = [Image.fromarray(f) for f in frames_np]
+                pil_frames[0].save(
+                    bio,
+                    format="WEBP",
+                    save_all=True,
+                    append_images=pil_frames[1:],
+                    duration=max(1, int(round(1000 / fps_float))),
+                    loop=loop_count,
+                )
+                pbar.update(num_frames)
 
-                    # Clamp or pad audio to exact total video duration
-                    target_samples = int(round(total_duration * a_sr))
-                    if a_wave.shape[1] > target_samples:
-                        a_wave = a_wave[:, :target_samples]
-                    elif a_wave.shape[1] < target_samples:
-                        pad = torch.zeros((ch, target_samples - a_wave.shape[1]), dtype=a_wave.dtype)
-                        a_wave = torch.cat([a_wave, pad], dim=1)
+            else:
+                is_webm = "webm" in format
+                container_fmt = "webm" if is_webm else "mp4"
+                video_codec = "libvpx-vp9" if is_webm else "libx264"
+                mime_type = "video/webm" if is_webm else "video/mp4"
 
-                    a_codec = "libopus" if is_webm else "aac"
-                    target_rate = 48000 if is_webm else (a_sr if a_sr in (44100, 48000) else 44100)
-                    a_stream = container.add_stream(a_codec, rate=target_rate)
-                    layout = "stereo" if ch == 2 else "mono"
+                container = av.open(bio, mode="w", format=container_fmt)
+                fps_frac = fractions.Fraction(str(fps_float)).limit_denominator(1001)
 
-                    resampler = av.AudioResampler(
-                        format=a_stream.format.name,
-                        layout=layout,
-                        rate=target_rate,
-                        frame_size=a_stream.frame_size or 1024,
-                    )
-                    raw_aframe = av.AudioFrame.from_ndarray(a_wave.numpy(), format="fltp", layout=layout)
-                    raw_aframe.sample_rate = a_sr
-                except Exception as e:
-                    logger.warn(f"[VideoCombine] Audio init error: {e}")
-                    a_stream = None
+                v_stream = container.add_stream(video_codec, rate=fps_frac)
+                v_stream.width = width
+                v_stream.height = height
+                v_stream.pix_fmt = "yuv420p"
 
-            # Video Encoding with Monotonic PTS
-            for i, f in enumerate(frames_np):
-                v_frame = av.VideoFrame.from_ndarray(f, format="rgb24")
-                v_frame.pts = i
-                for packet in v_stream.encode(v_frame):
-                    container.mux(packet)
-                pbar.update(1)
+                # Keep thread count fixed (prevents thread thrashing/stack crashes with PyTorch OpenMP)
+                # Omit "+faststart" to avoid backward-seek corruption on in-memory BytesIO
+                v_stream.options = {"crf": "20", "preset": "fast", "threads": "4"}
 
-            for packet in v_stream.encode():
-                container.mux(packet)
+                # Audio Setup (Safely processed on CPU)
+                a_stream, resampler, raw_aframe = None, None, None
+                if audio is not None and isinstance(audio, dict) and "waveform" in audio:
+                    try:
+                        a_wave = audio["waveform"].detach().to("cpu")
+                        a_sr = int(audio.get("sample_rate", 44100))
+                        if a_wave.ndim == 3:
+                            a_wave = a_wave.squeeze(0)
 
-            # Audio Encoding with Explicit Sample PTS
-            if a_stream is not None and resampler is not None:
-                try:
-                    audio_pts = 0
-                    for rframe in resampler.resample(raw_aframe):
-                        rframe.pts = audio_pts
-                        audio_pts += rframe.samples
-                        for packet in a_stream.encode(rframe):
-                            container.mux(packet)
-                    for rframe in resampler.resample(None):
-                        rframe.pts = audio_pts
-                        audio_pts += rframe.samples
-                        for packet in a_stream.encode(rframe):
-                            container.mux(packet)
-                    for packet in a_stream.encode():
+                        ch = min(2, a_wave.shape[0])
+                        a_wave = a_wave[:ch]
+
+                        target_samples = int(round(total_duration * a_sr))
+                        if a_wave.shape[1] > target_samples:
+                            a_wave = a_wave[:, :target_samples]
+                        elif a_wave.shape[1] < target_samples:
+                            pad = torch.zeros((ch, target_samples - a_wave.shape[1]), dtype=a_wave.dtype)
+                            a_wave = torch.cat([a_wave, pad], dim=1)
+
+                        a_codec = "libopus" if is_webm else "aac"
+                        target_rate = 48000 if is_webm else (a_sr if a_sr in (44100, 48000) else 44100)
+                        a_stream = container.add_stream(a_codec, rate=target_rate)
+                        layout = "stereo" if ch == 2 else "mono"
+
+                        resampler = av.AudioResampler(
+                            format=a_stream.format.name,
+                            layout=layout,
+                            rate=target_rate,
+                            frame_size=a_stream.frame_size or 1024,
+                        )
+                        raw_aframe = av.AudioFrame.from_ndarray(
+                            np.ascontiguousarray(a_wave.numpy()), format="fltp", layout=layout
+                        )
+                        raw_aframe.sample_rate = a_sr
+                    except Exception as a_err:
+                        logger.error(f"[VideoCombine] Audio setup failed, continuing without audio: {a_err}")
+                        a_stream, resampler, raw_aframe = None, None, None
+
+                # Encode video frames
+                for i, f in enumerate(frames_np):
+                    v_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(f), format="rgb24")
+                    v_frame.pts = i
+                    for packet in v_stream.encode(v_frame):
                         container.mux(packet)
-                except Exception as e:
-                    logger.warn(f"[VideoCombine] Audio encode error: {e}")
+                    pbar.update(1)
 
-            container.close()
+                for packet in v_stream.encode():
+                    container.mux(packet)
 
-        # 3. Encrypt in RAM & Zero Plaintext
-        plaintext_buf = bytearray(bio.getvalue())
-        bio.close()
+                # Encode audio packets
+                if a_stream is not None and resampler is not None and raw_aframe is not None:
+                    try:
+                        audio_pts = 0
+                        for rframe in resampler.resample(raw_aframe):
+                            rframe.pts = audio_pts
+                            audio_pts += rframe.samples
+                            for packet in a_stream.encode(rframe):
+                                container.mux(packet)
+                        for rframe in resampler.resample(None):
+                            rframe.pts = audio_pts
+                            audio_pts += rframe.samples
+                            for packet in a_stream.encode(rframe):
+                                container.mux(packet)
+                        for packet in a_stream.encode():
+                            container.mux(packet)
+                    except Exception as a_enc_err:
+                        logger.error(f"[VideoCombine] Audio encode error: {a_enc_err}")
 
-        try:
+                container.close()
+
+            # 4. In-RAM Encryption & Secure Storage
+            browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
+            plaintext_buf = bytearray(bio.getvalue())
+            bio.close()
+
             encrypted_payload = encrypt_buffer_for_browser(plaintext_buf, browser_pubkey)
+
+            output_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
+            full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(filename_prefix, output_dir)
+            os.makedirs(full_output_folder, exist_ok=True)
+
+            bin_filename = f"{filename}_{counter:05}.bin"
+            bin_path = os.path.join(full_output_folder, bin_filename)
+
+            with open(bin_path, "wb") as f:
+                f.write(encrypted_payload)
+
+            preview_item = {
+                "filename": bin_filename,
+                "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+                "format": mime_type,
+                "frame_rate": fps_float,
+            }
+
+            return {
+                "ui": {"ram_preview": [preview_item]},
+                "result": ((save_output, [bin_path]),),
+            }
+
+        except Exception as e:
+            logger.error(f"[VideoCombine] Fatal encoding error: {e}", exc_info=True)
+            raise e
+
         finally:
-            plaintext_buf[:] = b"\x00" * len(plaintext_buf)
-            del plaintext_buf
-
-        # 4. Save Only Encrypted .bin File
-        output_dir = (
-            folder_paths.get_output_directory()
-            if save_output
-            else folder_paths.get_temp_directory()
-        )
-        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
-            filename_prefix, output_dir
-        )
-        os.makedirs(full_output_folder, exist_ok=True)
-
-        bin_filename = f"{filename}_{counter:05}.bin"
-        bin_path = os.path.join(full_output_folder, bin_filename)
-
-        with open(bin_path, "wb") as f:
-            f.write(encrypted_payload)
-
-        preview_item = {
-            "filename": bin_filename,
-            "subfolder": subfolder,
-            "type": "output" if save_output else "temp",
-            "format": mime_type,
-            "frame_rate": fps_float,
-        }
-
-        return {
-            "ui": {
-                "ram_preview": [preview_item],
-            },
-            "result": ((save_output, [bin_path]),),
-        }
+            # 5. Mandatory RAM Zeroization
+            if plaintext_buf is not None:
+                plaintext_buf[:] = b"\x00" * len(plaintext_buf)
+                del plaintext_buf
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
