@@ -1210,7 +1210,7 @@ class RestartSignal:
     RETURN_TYPES = ()
     FUNCTION = "request_restart"
     OUTPUT_NODE = True
-    CATEGORY = "System"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
 
     def request_restart(self):
         flag = "/tmp/comfyui_restart.request"
