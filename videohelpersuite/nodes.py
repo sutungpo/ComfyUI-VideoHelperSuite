@@ -1199,8 +1199,30 @@ class VideoCombine:
             bio.close()
             gc.collect()
 
+# =====================================================================
+# 4. Restart Node
+# =====================================================================
+class RestartSignal:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "request_restart"
+    OUTPUT_NODE = True
+    CATEGORY = "System"
+
+    def request_restart(self):
+        flag = "/tmp/comfyui_restart.request"
+        with open(flag, "w") as f:
+            f.write("restart")
+
+        logger.warning("[RestartSignal] Restart requested.")
+        return {}
+
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
+    "VHS_RestartSignal": RestartSignal,
     "VHS_LoadVideo": LoadVideoUpload,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadVideoFFmpeg": LoadVideoFFmpegUpload,
@@ -1245,6 +1267,7 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_VideoCombine": "Video Combine 🎥🅥🅗🅢",
+    "VHS_RestartSignal": "Restart Signal 🎥🅥🅗🅢",
     "VHS_LoadVideo": "Load Video (Upload) 🎥🅥🅗🅢",
     "VHS_LoadVideoPath": "Load Video (Path) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpeg": "Load Video FFmpeg (Upload) 🎥🅥🅗🅢",
