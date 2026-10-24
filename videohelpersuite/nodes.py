@@ -1344,6 +1344,9 @@ class VideoCombine:
 # =====================================================================
 import time
 import zipfile
+from server import PromptServer
+from aiohttp import web
+
 def _to_cpu(obj):
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
@@ -1366,13 +1369,12 @@ def _list_storage_files(prefix):
                     found.append(file)
     return [""] + sorted(list(set(found)))
 
-# Class name without "VHS_" prefix prevents VHS.core.js from truncating description
 class LatentConditioningStorage:
     DESCRIPTION = (
         "Save and load Latent and Conditioning tensors.\n"
         "• Save: Connect latent or conditioning to auto-save to disk.\n"
         "• Upload: Drag and drop .pt or .zip files directly onto the node.\n"
-        "• Download: Right-click node -> 'Download Latent & Conditioning'."
+        "• Download: Right-click node -> 'Download (Compressed Zip)'."
     )
 
     @classmethod
@@ -1381,11 +1383,11 @@ class LatentConditioningStorage:
             "required": {
                 "latent_file": (
                     _list_storage_files("latent_"),
-                    {"default": "", "tooltip": "Drop a latent_*.pt or .zip file here."}
+                    {"default": "", "tooltip": "Select a latent file or drop a .pt/.zip file here."}
                 ),
                 "cond_file": (
                     _list_storage_files("cond_"),
-                    {"default": "", "tooltip": "Drop a cond_*.pt or .zip file here."}
+                    {"default": "", "tooltip": "Select a conditioning file or drop a .pt/.zip file here."}
                 ),
             },
             "optional": {
@@ -1397,7 +1399,7 @@ class LatentConditioningStorage:
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
     FUNCTION = "process"
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    "Video Helper Suite 🎥🅥🅗🅢"
     OUTPUT_NODE = True
 
     def process(self, latent_file="", cond_file="", latent=None, conditioning=None):
@@ -1432,7 +1434,7 @@ class LatentConditioningStorage:
         elif cond_file and cond_file.strip():
             out_cond = self._load_file(cond_file.strip(), expected_type="cond")
 
-        # --- Bundle into single .zip archive ---
+        # --- Save zip archive to disk if saving ---
         if files_to_compress:
             zip_filename = f"latcond_{ts}.zip"
             zip_filepath = os.path.join(out_dir, zip_filename)
@@ -1445,8 +1447,6 @@ class LatentConditioningStorage:
             if os.path.exists(zip_filepath):
                 os.remove(zip_filepath)
             os.replace(tmp_zip, zip_filepath)
-
-            ui_updates["zip_file"] = [zip_filename]
 
         return {"ui": ui_updates, "result": (out_latent, out_cond)}
 
@@ -1463,34 +1463,73 @@ class LatentConditioningStorage:
                 except OSError:
                     pass
 
-    @staticmethod
-    def _load_file(filename, expected_type=None):
+    @classmethod
+    def _find_file_path(cls, filename):
         for base in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
             target = os.path.join(base, filename)
             if os.path.isfile(target):
-                if filename.endswith(".zip"):
-                    with zipfile.ZipFile(target, "r") as zf:
-                        names = zf.namelist()
-                        target_name = None
-                        if expected_type:
-                            target_name = next((n for n in names if expected_type in n.lower() and n.endswith(".pt")), None)
-                        if not target_name:
-                            target_name = next((n for n in names if n.endswith(".pt")), None)
+                return target
+        return None
 
-                        if target_name:
-                            with zf.open(target_name) as f:
-                                try:
-                                    return torch.load(f, map_location="cpu", weights_only=False)
-                                except TypeError:
-                                    return torch.load(f, map_location="cpu")
-                else:
-                    try:
-                        return torch.load(target, map_location="cpu", weights_only=False)
-                    except TypeError:
-                        return torch.load(target, map_location="cpu")
+    @classmethod
+    def _load_file(cls, filename, expected_type=None):
+        target = cls._find_file_path(filename)
+        if target:
+            if filename.endswith(".zip"):
+                with zipfile.ZipFile(target, "r") as zf:
+                    names = zf.namelist()
+                    target_name = None
+                    if expected_type:
+                        target_name = next((n for n in names if expected_type in n.lower() and n.endswith(".pt")), None)
+                    if not target_name:
+                        target_name = next((n for n in names if n.endswith(".pt")), None)
+
+                    if target_name:
+                        with zf.open(target_name) as f:
+                            try:
+                                return torch.load(f, map_location="cpu", weights_only=False)
+                            except TypeError:
+                                return torch.load(f, map_location="cpu")
+            else:
+                try:
+                    return torch.load(target, map_location="cpu", weights_only=False)
+                except TypeError:
+                    return torch.load(target, map_location="cpu")
 
         raise FileNotFoundError(f"[Storage Node] Could not locate file: {filename}")
 
+# --- Server Endpoint: Always streams a single compressed zip file ---
+@PromptServer.instance.routes.get("/latcond/download")
+async def download_latcond_zip(request):
+    latent_file = request.rel_url.query.get("latent_file", "").strip()
+    cond_file = request.rel_url.query.get("cond_file", "").strip()
+
+    files_to_pack = []
+    for fname in [latent_file, cond_file]:
+        if fname:
+            path = LatentConditioningStorage._find_file_path(fname)
+            if path and os.path.isfile(path):
+                files_to_pack.append((path, os.path.basename(path)))
+
+    if not files_to_pack:
+        return web.Response(status=404, text="No valid files selected to download.")
+
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for full_path, arc_name in files_to_pack:
+            zf.write(full_path, arcname=arc_name)
+
+    zip_bytes = bio.getvalue()
+    bio.close()
+
+    ts = int(time.time())
+    zip_filename = f"latcond_{ts}.zip"
+
+    return web.Response(
+        body=zip_bytes,
+        content_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'}
+    )
 # =====================================================================
 # 5. Restart Node
 # =====================================================================

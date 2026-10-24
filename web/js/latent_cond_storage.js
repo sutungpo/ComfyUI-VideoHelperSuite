@@ -1,16 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-function downloadFile(filename, type = "output") {
-    if (!filename) return;
-    const a = document.createElement("a");
-    a.href = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=${type}`);
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    requestAnimationFrame(() => a.remove());
-}
-
 async function uploadAndAssignFile(node, file) {
     const formData = new FormData();
     formData.append("image", file, file.name);
@@ -20,9 +10,6 @@ async function uploadAndAssignFile(node, file) {
     if (!res.ok) throw new Error(`Upload failed for ${file.name}`);
     const data = await res.json();
     const uploadedName = data.name;
-
-    node._fileTypes = node._fileTypes || {};
-    node._fileTypes[uploadedName] = "input";
 
     const lowerName = uploadedName.toLowerCase();
     const latentWidget = node.widgets?.find(w => w.name === "latent_file");
@@ -50,7 +37,6 @@ app.registerExtension({
     name: "ComfyUI.LatentConditioningStorage",
 
     nodeCreated(node) {
-        // Support both naming formats
         const isStorageNode = node.comfyClass === "LatentConditioningStorage" || 
                               node.type === "LatentConditioningStorage" ||
                               node.comfyClass === "VHS_LatentConditioningStorage" || 
@@ -62,25 +48,24 @@ app.registerExtension({
             "Save and load Latent and Conditioning tensors.",
             "• Save: Connect latent or conditioning to auto-save to disk.",
             "• Upload: Drag and drop .pt or .zip files directly onto the node.",
-            "• Download: Right-click node -> 'Download Latent & Conditioning'."
+            "• Download: Right-click node -> 'Download (Compressed Zip)'."
         ].join("\n");
 
         node.tooltip = fullDescription;
         node.getTooltip = () => fullDescription;
 
-        // 1. VHS Pattern: Explicitly notify ComfyUI's core that this node is targeted
+        // 1. Drag & Drop Support
         node.onDragOver = function (e) {
             if (e?.dataTransfer?.types?.includes("Files")) {
                 e.preventDefault();
                 e.stopPropagation();
                 e.dataTransfer.dropEffect = "copy";
-                app.dragOverNode = node; // Tells ComfyUI app.ts exactly which node owns this drop
+                app.dragOverNode = node;
                 return true;
             }
             return false;
         };
 
-        // 2. Returns true to fulfill ComfyUI's `if (await n?.onDragDrop?.(event)) return;`
         node.onDragDrop = async function (e) {
             if (!e?.dataTransfer?.types?.includes("Files")) return false;
 
@@ -97,38 +82,34 @@ app.registerExtension({
                 }
                 node.setDirtyCanvas?.(true, true);
                 app.graph?.setDirtyCanvas(true, true);
-                return true; // Signals ComfyUI to completely abort workflow loading
+                return true;
             } catch (err) {
                 alert(err.message);
-                return true; // Still return true so ComfyUI doesn't try loading as workflow on failure
+                return true;
             }
         };
 
-        // 3. Right-Click Context Menu
+        // 2. Right-Click Context Menu: ALWAYS downloads a single compressed .zip
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
 
-            const zipFile = node._lastZipFile;
-            const latentFile = this.widgets?.find(w => w.name === "latent_file")?.value;
-            const condFile = this.widgets?.find(w => w.name === "cond_file")?.value;
+            const latentFile = this.widgets?.find(w => w.name === "latent_file")?.value || "";
+            const condFile = this.widgets?.find(w => w.name === "cond_file")?.value || "";
 
-            if (zipFile || latentFile || condFile) {
+            if (latentFile || condFile) {
                 options.push({
-                    content: "Download Latent & Conditioning",
+                    content: "Download (Compressed Zip)",
                     callback: () => {
-                        if (node._lastZipFile) {
-                            const fileType = node._fileTypes?.[node._lastZipFile] || "output";
-                            downloadFile(node._lastZipFile, fileType);
-                        } else {
-                            const toDownload = [];
-                            if (latentFile) toDownload.push({ name: latentFile, type: node._fileTypes?.[latentFile] || "output" });
-                            if (condFile) toDownload.push({ name: condFile, type: node._fileTypes?.[condFile] || "output" });
-
-                            toDownload.forEach((item, idx) => {
-                                setTimeout(() => downloadFile(item.name, item.type), idx * 200);
-                            });
-                        }
+                        // Requests single zip archive from backend - NO multi-file loop
+                        const url = api.apiURL(
+                            `/latcond/download?latent_file=${encodeURIComponent(latentFile)}&cond_file=${encodeURIComponent(condFile)}`
+                        );
+                        const a = document.createElement("a");
+                        a.href = url;
+                        document.body.appendChild(a);
+                        a.click();
+                        requestAnimationFrame(() => a.remove());
                     }
                 });
             }
@@ -148,9 +129,6 @@ app.registerExtension({
             if (!isStorageNode) return;
 
             const ui = detail.output;
-            if (ui?.zip_file?.[0]) {
-                node._lastZipFile = ui.zip_file[0];
-            }
             if (ui?.latent_file?.[0]) {
                 const w = node.widgets?.find(w => w.name === "latent_file");
                 if (w) {
