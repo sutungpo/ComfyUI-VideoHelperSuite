@@ -27,6 +27,75 @@ async function ensureBrowserKeys() {
     }
     return browserPublicKeyPEM;
 }
+// --- Key Export & Import Helpers ---
+async function exportBrowserKey() {
+    await ensureBrowserKeys();
+    if (!browserKeyPair) return;
+    try {
+        const privJwk = await window.crypto.subtle.exportKey("jwk", browserKeyPair.privateKey);
+        const pubJwk = await window.crypto.subtle.exportKey("jwk", browserKeyPair.publicKey);
+        const payload = JSON.stringify({
+            app: "ComfyUI_RAMEncryption",
+            created: new Date().toISOString(),
+            publicKey: pubJwk,
+            privateKey: privJwk
+        }, null, 2);
+
+        const blob = new Blob([payload], { type: "application/json" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `comfy_browser_key_${Date.now()}.json`;
+        document.body.appendChild(a);
+        a.click();
+        requestAnimationFrame(() => {
+            URL.revokeObjectURL(a.href);
+            a.remove();
+        });
+    } catch (err) {
+        alert("Failed to export key: " + err.message);
+    }
+}
+
+function importBrowserKey() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = async () => {
+        if (!input.files?.length) return;
+        try {
+            const text = await input.files[0].text();
+            const data = JSON.parse(text);
+            if (!data.privateKey || !data.publicKey) {
+                throw new Error("Invalid key file: missing public or private key structure.");
+            }
+
+            const privateKey = await window.crypto.subtle.importKey(
+                "jwk",
+                data.privateKey,
+                { name: "RSA-OAEP", hash: "SHA-256" },
+                true,
+                ["unwrapKey", "decrypt"]
+            );
+            const publicKey = await window.crypto.subtle.importKey(
+                "jwk",
+                data.publicKey,
+                { name: "RSA-OAEP", hash: "SHA-256" },
+                true,
+                ["wrapKey"]
+            );
+
+            // Replace active session keys in RAM
+            browserKeyPair = { publicKey, privateKey };
+            const spki = await window.crypto.subtle.exportKey("spki", publicKey);
+            browserPublicKeyPEM = arrayBufferToPem(spki, "PUBLIC KEY");
+
+            alert("Browser encryption key imported successfully. Active session key has been updated.");
+        } catch (err) {
+            alert("Failed to import key: " + err.message);
+        }
+    };
+    input.click();
+}
 
 // --- Preview & Sizing Helpers ---
 function resizeNodeForMedia(node, width, height) {
@@ -380,7 +449,7 @@ app.registerExtension({
             };
         }
 
-        // Context menu options for saving decrypted media
+        // Context menu options for saving decrypted media and managing keys
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
@@ -404,6 +473,17 @@ app.registerExtension({
                             content: "Open preview",
                             callback: () => { window.open(blobUrl, "_blank"); }
                         }
+                    );
+                }
+            }
+
+            // Expose Key Management options on all encryption/preview nodes
+            if (isImagePreview || isVideoCombine || isImage || isLoadVideo) {
+                if (!options.some(opt => opt?.content === "Export Browser Encryption Key")) {
+                    options.push(
+                        null, // visual divider in litegraph context menu
+                        { content: "Export Browser Encryption Key", callback: exportBrowserKey },
+                        { content: "Import Browser Encryption Key", callback: importBrowserKey }
                     );
                 }
             }
