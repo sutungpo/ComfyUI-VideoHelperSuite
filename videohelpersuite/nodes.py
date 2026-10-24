@@ -1340,7 +1340,7 @@ class VideoCombine:
             gc.collect()
 
 # =====================================================================
-# 4. Restart Node
+# 4. Save Node
 # =====================================================================
 def _to_cpu(obj):
     """Recursively moves all tensors to CPU to prevent CUDA memory locks and device mismatch."""
@@ -1464,8 +1464,11 @@ class RestartSignal:
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
-    "VHS_RestartSignal": RestartSignal,
     "VHS_LoadVideo": LoadVideoUpload,
+    "VHS_ImageUploadRAM": VHS_ImageUploadRAM,
+    "VHS_ImagePreviewRAM": VHS_ImagePreviewRAM,
+    "VHS_LatentConditioningStorage": VHS_LatentConditioningStorage,
+    "VHS_RestartSignal": RestartSignal,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadVideoFFmpeg": LoadVideoFFmpegUpload,
     "VHS_LoadVideoFFmpegPath": LoadVideoFFmpegPath,
@@ -1509,8 +1512,11 @@ NODE_CLASS_MAPPINGS = {
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_VideoCombine": "Video Combine 🎥🅥🅗🅢",
-    "VHS_RestartSignal": "Restart Signal 🎥🅥🅗🅢",
     "VHS_LoadVideo": "Load Video (Upload) 🎥🅥🅗🅢",
+    "VHS_ImageUploadRAM": "Load Image (Upload) 🎥🅥🅗🅢",
+    "VHS_ImagePreviewRAM": "Image Preview (RAM) 🎥🅥🅗🅢",
+    "VHS_LatentConditioningStorage": "Latent Conditioning Storage 🎥🅥🅗🅢",
+    "VHS_RestartSignal": "Restart Signal 🎥🅥🅗🅢",
     "VHS_LoadVideoPath": "Load Video (Path) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpeg": "Load Video FFmpeg (Upload) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpegPath": "Load Video FFmpeg (Path) 🎥🅥🅗🅢",
