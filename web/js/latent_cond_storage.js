@@ -29,7 +29,6 @@ async function uploadAndAssignFile(node, file) {
     const condWidget = node.widgets?.find(w => w.name === "cond_file");
 
     if (lowerName.endsWith(".zip")) {
-        // Dropping a zip assigns it to both widgets (the backend inspects both inside the zip)
         [latentWidget, condWidget].forEach(w => {
             if (w) {
                 if (w.options?.values && !w.options.values.includes(uploadedName)) {
@@ -53,7 +52,16 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage") return;
 
-        // 1. Drag & Drop Support (.pt and .zip)
+        // Restore full multi-line hover tooltip (bypasses VHS.core.js single-line truncation)
+        node.tooltip = [
+            "Save and load Latent and Conditioning tensors.",
+            "• Save: Connect latent or conditioning to auto-save to disk.",
+            "• Upload: Drag and drop .pt or .zip files directly onto the node.",
+            "• Upload: latent file start with 'latent_' & conditioning file with 'cond_'.\n",
+            "• Download: Right-click node -> 'Download (Compressed Zip)'."
+        ].join("\n");
+
+        // Drag & Drop Support (.pt and .zip)
         node.onDragOver = (e) => !!e?.dataTransfer?.types?.includes?.("Files");
 
         node.onDragDrop = async function (e) {
@@ -74,7 +82,7 @@ app.registerExtension({
             }
         };
 
-        // 2. Right-Click Context Menu (Single Compressed Zip Download)
+        // Right-Click Context Menu (Single Compressed Zip Download)
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
@@ -93,7 +101,6 @@ app.registerExtension({
     },
 
     setup() {
-        // Track the single zip file and update dropdowns when execution completes
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
             if (!node || (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage")) return;
