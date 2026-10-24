@@ -1,7 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-function triggerUpload(node, widgetName) {
+function uploadFile(node, widgetName) {
     const input = document.createElement("input");
     input.type = "file";
     input.accept = ".pt";
@@ -15,7 +15,7 @@ function triggerUpload(node, widgetName) {
 
         try {
             const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
-            if (!res.ok) throw new Error(`Upload failed: ${res.statusText}`);
+            if (!res.ok) throw new Error(`Upload failed with status ${res.status}`);
             const data = await res.json();
 
             const widget = node.widgets?.find(w => w.name === widgetName);
@@ -26,16 +26,17 @@ function triggerUpload(node, widgetName) {
                 widget.value = data.name;
                 node._fileTypes = node._fileTypes || {};
                 node._fileTypes[data.name] = "input";
-                node.setDirtyCanvas(true, true);
+                node.setDirtyCanvas?.(true, true);
+                app.graph?.setDirtyCanvas(true, true);
             }
         } catch (err) {
-            alert(err.message);
+            alert("Upload failed: " + err.message);
         }
     };
     input.click();
 }
 
-function triggerDownload(node, widgetName, label) {
+function downloadFile(node, widgetName, label) {
     const widget = node.widgets?.find(w => w.name === widgetName);
     const filename = widget?.value;
     if (!filename) {
@@ -51,40 +52,64 @@ function triggerDownload(node, widgetName, label) {
     requestAnimationFrame(() => a.remove());
 }
 
+function setupButton(node, name, label, callback) {
+    let btn = node.widgets?.find(w => w.name === name);
+    if (!btn) {
+        btn = node.addWidget("button", name, label, callback);
+    } else {
+        btn.label = label;
+        btn.callback = callback;
+    }
+    btn.serialize = false;
+    return btn;
+}
+
 app.registerExtension({
     name: "ComfyUI.VHS.LatentConditioningStorage",
 
+    // Step 1: Declare buttons in nodeData.input.optional to prevent VHS schema pruning
+    beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === "VHS_LatentConditioningStorage") {
+            nodeData.input = nodeData.input || {};
+            nodeData.input.optional = nodeData.input.optional || {};
+            nodeData.input.optional["upload_latent"] = ["BUTTON", {}];
+            nodeData.input.optional["download_latent"] = ["BUTTON", {}];
+            nodeData.input.optional["upload_cond"] = ["BUTTON", {}];
+            nodeData.input.optional["download_cond"] = ["BUTTON", {}];
+        }
+    },
+
+    // Step 2: Bind handlers and resize node
     nodeCreated(node) {
-        if (node.comfyClass !== "VHS_LatentConditioningStorage") return;
+        if (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage") return;
 
-        // Latent controls: [ ⬆ Latent ] and [ ⬇ Latent ]
-        const btnUploadLatent = node.addWidget("button", "upload_latent", "⬆ Upload Latent", () => {
-            triggerUpload(node, "latent_file");
+        setupButton(node, "upload_latent", "⬆ Upload Latent", () => {
+            uploadFile(node, "latent_file");
         });
-        btnUploadLatent.serialize = false;
 
-        const btnDownloadLatent = node.addWidget("button", "download_latent", "⬇ Download Latent", () => {
-            triggerDownload(node, "latent_file", "Latent");
+        setupButton(node, "download_latent", "⬇ Download Latent", () => {
+            downloadFile(node, "latent_file", "Latent");
         });
-        btnDownloadLatent.serialize = false;
 
-        // Conditioning controls: [ ⬆ Cond ] and [ ⬇ Cond ]
-        const btnUploadCond = node.addWidget("button", "upload_cond", "⬆ Upload Cond", () => {
-            triggerUpload(node, "cond_file");
+        setupButton(node, "upload_cond", "⬆ Upload Cond", () => {
+            uploadFile(node, "cond_file");
         });
-        btnUploadCond.serialize = false;
 
-        const btnDownloadCond = node.addWidget("button", "download_cond", "⬇ Download Cond", () => {
-            triggerDownload(node, "cond_file", "Conditioning");
+        setupButton(node, "download_cond", "⬇ Download Cond", () => {
+            downloadFile(node, "cond_file", "Conditioning");
         });
-        btnDownloadCond.serialize = false;
+
+        // Ensure canvas recalculates size so all 4 buttons and dropdowns are visible
+        node.setSize(node.computeSize());
+        node.setDirtyCanvas?.(true, true);
+        app.graph?.setDirtyCanvas(true, true);
     },
 
     setup() {
-        // Auto-select saved file on execution finish
+        // Step 3: Listen for execution completion to auto-populate newly saved files
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
-            if (!node || node.comfyClass !== "VHS_LatentConditioningStorage") return;
+            if (!node || (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage")) return;
 
             const ui = detail.output;
             if (ui?.latent_file?.[0]) {
@@ -103,7 +128,8 @@ app.registerExtension({
                     w.value = name;
                 }
             }
-            node.setDirtyCanvas(true, true);
+            node.setDirtyCanvas?.(true, true);
+            app.graph?.setDirtyCanvas(true, true);
         });
     }
 });

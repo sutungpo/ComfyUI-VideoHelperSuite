@@ -1343,7 +1343,7 @@ class VideoCombine:
 # 4. Save Node
 # =====================================================================
 def _to_cpu(obj):
-    """Recursively moves all tensors to CPU to prevent CUDA memory locks and device mismatch."""
+    """Recursively moves tensors to CPU to avoid CUDA serialization and VRAM locking."""
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
     elif isinstance(obj, dict):
@@ -1355,35 +1355,33 @@ def _to_cpu(obj):
     return obj
 
 def _list_pt_files(prefix):
-    """Lists .pt files matching the prefix from output and input folders."""
+    """Scans ComfyUI output and input directories for .pt files with the given prefix."""
     found = []
     for directory in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
         if os.path.exists(directory):
             for file in os.listdir(directory):
                 if file.startswith(prefix) and file.endswith(".pt"):
                     found.append(file)
-    return sorted(list(set(found)))
+    # agent.md rule: default empty string to avoid accidental auto-selection
+    return [""] + sorted(list(set(found)))
 
 class VHS_LatentConditioningStorage:
     @classmethod
     def INPUT_TYPES(cls):
-        # agent.md rule: default empty string to avoid accidental auto-selection
-        latent_files = [""] + _list_pt_files("latent_")
-        cond_files = [""] + _list_pt_files("cond_")
         return {
             "required": {},
             "optional": {
                 "latent": ("LATENT",),
                 "conditioning": ("CONDITIONING",),
-                "latent_file": (latent_files, {"default": ""}),
-                "cond_file": (cond_files, {"default": ""}),
+                "latent_file": (_list_pt_files("latent_"), {"default": ""}),
+                "cond_file": (_list_pt_files("cond_"), {"default": ""}),
             }
         }
 
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
     FUNCTION = "process"
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/storage"
     OUTPUT_NODE = True
 
     def process(self, latent=None, conditioning=None, latent_file="", cond_file=""):
@@ -1391,7 +1389,7 @@ class VHS_LatentConditioningStorage:
         out_cond = None
         ui_updates = {}
 
-        # --- Latent Item ---
+        # --- Latent Handler ---
         if latent is not None:
             # Save: simple sequential name (latent_00001_.pt)
             out_dir = folder_paths.get_output_directory()
@@ -1405,7 +1403,7 @@ class VHS_LatentConditioningStorage:
             data = self._load_file(latent_file.strip())
             out_latent = data if (isinstance(data, dict) and "samples" in data) else {"samples": data}
 
-        # --- Conditioning Item ---
+        # --- Conditioning Handler ---
         if conditioning is not None:
             # Save: simple sequential name (cond_00001_.pt)
             out_dir = folder_paths.get_output_directory()
@@ -1428,7 +1426,10 @@ class VHS_LatentConditioningStorage:
             os.replace(tmp_path, filepath)
         finally:
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _load_file(filename):
