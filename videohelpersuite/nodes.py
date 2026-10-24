@@ -13,6 +13,7 @@ from pathlib import Path
 from string import Template
 import itertools
 import functools
+import gc
 
 import folder_paths
 from .logger import logger
@@ -885,7 +886,164 @@ class VHS_ImagePreviewRAM:
 # =====================================================================
 # 3. Synchronized Video Combine Node
 # =====================================================================
-import gc
+
+# ------------------------------------------------------------------------------
+# VideoCombine (RAM-encrypted) - low-memory refactor
+#
+# Drop-in replacement for the VideoCombine class in nodes.py.
+# Keep your existing top-of-file imports (gc, io, os, fractions, numpy as np,
+# torch, av, PIL.Image, folder_paths, ProgressBar, logger, AESGCM, padding,
+# hashes, extract_browser_public_key, imageOrLatent, floatOrInt) and add:
+#
+#     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+#
+# `AESGCM` is no longer used by this node and may be dropped if nothing else
+# in nodes.py needs it.
+# ------------------------------------------------------------------------------
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+# Float working-set budget for ONE quantization chunk (bytes of float32).
+# 64 MB = ~5 frames @720p, 1 frame @4K. Peak extra RAM is ~2x this (float + u8).
+_CHUNK_FLOAT_BUDGET = 64 * 1024 * 1024
+# Slice size used for streaming encryption and for zeroization.
+_IO_SLICE = 1 << 20
+_ZERO_SLICE = memoryview(bytes(_IO_SLICE))
+
+
+def _zeroize_view(view):
+    """Rule 3: zero-fill a writable byte view in 1 MiB slices (no full-size temp)."""
+    n = len(view)
+    for off in range(0, n, _IO_SLICE):
+        end = min(off + _IO_SLICE, n)
+        view[off:end] = _ZERO_SLICE[: end - off]
+
+
+class _FrameSource:
+    """
+    Virtual [0, N) frame sequence over one or more (n,H,W,C) tensors.
+
+    - No torch.cat, no full-size copy, no full-size uint8 tensor.
+    - Frames are quantized chunk by chunk with the same math as before:
+        round(clamp(x, 0, 1) * 255) -> uint8
+    - Data stays on its own device; only the small uint8 chunk is moved to CPU.
+    - Input tensors are never mutated (work happens in private buffers).
+    - Yielded chunks are views of reusable buffers: consume before advancing.
+    """
+
+    def __init__(self, parts):
+        norm = []
+        for idx, p in enumerate(parts):
+            if isinstance(p, np.ndarray):
+                p = torch.from_numpy(p)
+            if not isinstance(p, torch.Tensor):
+                logger.warning(f"[VideoCombine] Skipping unrecognized chunk index {idx}: {type(p)}")
+                continue
+            p = p.detach()
+            if p.ndim == 3:  # (H,W,C) -> (1,H,W,C)
+                p = p.unsqueeze(0)
+            elif p.ndim == 2:  # (H,W) -> (1,H,W,1)
+                p = p.unsqueeze(0).unsqueeze(-1)
+            elif p.ndim == 5:  # (B,T,H,W,C) video-VAE output -> (B*T,H,W,C)
+                p = p.reshape(-1, *p.shape[-3:])
+            elif p.ndim != 4:
+                raise ValueError(f"[VideoCombine] Unsupported image tensor rank {p.ndim}.")
+            if p.shape[0] == 0:
+                continue
+            norm.append(p)
+
+        if not norm:
+            raise ValueError("[VideoCombine] Empty image sequence.")
+
+        h, w = norm[0].shape[1], norm[0].shape[2]
+        for p in norm:
+            if p.shape[1] != h or p.shape[2] != w:
+                raise ValueError(
+                    f"[VideoCombine] Mixed frame sizes in input: {(h, w)} vs {tuple(p.shape[1:3])}."
+                )
+
+        # Lossless 1-pixel boundary crop for odd codec alignments (no interpolation blur)
+        self.height = h - (h % 2)
+        self.width = w - (w % 2)
+        if self.height < 2 or self.width < 2:
+            raise ValueError(f"[VideoCombine] Frame size {w}x{h} is too small to encode.")
+
+        self.parts = norm
+        self.offsets = []
+        total = 0
+        for p in norm:
+            self.offsets.append(total)
+            total += p.shape[0]
+        self.num_frames = total
+
+        self.chunk_frames = max(1, _CHUNK_FLOAT_BUDGET // (self.height * self.width * 3 * 4))
+        self._fbuf = {}  # device -> float32 work buffer
+        self._ubuf = {}  # device -> uint8 work buffer
+
+    def _buffers(self, device, n):
+        if device not in self._fbuf:
+            shape = (self.chunk_frames, self.height, self.width, 3)
+            self._fbuf[device] = torch.empty(shape, dtype=torch.float32, device=device)
+            self._ubuf[device] = torch.empty(shape, dtype=torch.uint8, device=device)
+        return self._fbuf[device][:n], self._ubuf[device][:n]
+
+    def _quantize(self, part, s, e):
+        n = e - s
+        x = part[s:e, : self.height, : self.width, :]
+        if x.shape[-1] == 1:
+            x = x.expand(-1, -1, -1, 3)  # grayscale -> RGB (view)
+        else:
+            x = x[..., :3]
+        fb, ub = self._buffers(part.device, n)
+        fb.copy_(x)  # private float32 copy (also does dtype conversion)
+        torch.nan_to_num(fb, nan=0.0, out=fb)
+        fb.clamp_(0.0, 1.0).mul_(255.0).round_()
+        ub.copy_(fb)  # float -> uint8 (values are exact integers 0..255)
+        if ub.device.type != "cpu":
+            ub = ub.cpu()  # only the small uint8 chunk crosses to system RAM
+        return ub
+
+    def chunks(self, start, stop, reverse=False):
+        """Yield (n,h,w,3) uint8 CPU chunks covering [start, stop); flipped if reverse."""
+        order = range(len(self.parts) - 1, -1, -1) if reverse else range(len(self.parts))
+        for pi in order:
+            part, off = self.parts[pi], self.offsets[pi]
+            lo, hi = max(start, off) - off, min(stop, off + part.shape[0]) - off
+            if lo >= hi:
+                continue
+            if reverse:
+                e = hi
+                while e > lo:
+                    s = max(lo, e - self.chunk_frames)
+                    yield self._quantize(part, s, e).flip(0)
+                    e = s
+            else:
+                s = lo
+                while s < hi:
+                    e = min(hi, s + self.chunk_frames)
+                    yield self._quantize(part, s, e)
+                    s = e
+
+    def frames(self, pingpong=False):
+        """Yield single (h,w,3) uint8 numpy views in playback order."""
+        n = self.num_frames
+        for c in self.chunks(0, n):
+            for i in range(c.shape[0]):
+                yield c[i].numpy()
+        if pingpong and n > 2:
+            # forward + frames [n-2 ... 1]  (same sequence as cat([x, x[1:-1].flip(0)]))
+            for c in self.chunks(1, n - 1, reverse=True):
+                for i in range(c.shape[0]):
+                    yield c[i].numpy()
+
+    def total_frames(self, pingpong=False):
+        n = self.num_frames
+        return n + (n - 2) if (pingpong and n > 2) else n
+
+    def close(self):
+        for d in (self._fbuf, self._ubuf):
+            for b in d.values():
+                b.zero_()
+            d.clear()
+
 class VideoCombine:
     @classmethod
     def INPUT_TYPES(s):
@@ -917,6 +1075,68 @@ class VideoCombine:
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     FUNCTION = "combine_video"
 
+    # ------------------------------------------------------------------ audio
+    @staticmethod
+    def _setup_audio(container, audio, total_duration, is_webm):
+        """Returns (a_stream, resampler, raw_aframe) or (None, None, None). CPU only, 1x speed."""
+        if not (audio is not None and isinstance(audio, dict) and "waveform" in audio):
+            return None, None, None
+        try:
+            a_wave = audio["waveform"].detach().to("cpu")
+            a_sr = int(audio.get("sample_rate", 44100))
+            if a_wave.ndim == 3:
+                a_wave = a_wave.squeeze(0)
+            a_wave = a_wave.to(torch.float32)  # fltp requires float32
+
+            ch = min(2, a_wave.shape[0])
+            a_wave = a_wave[:ch]
+
+            target_samples = int(round(total_duration * a_sr))
+            if a_wave.shape[1] > target_samples:
+                a_wave = a_wave[:, :target_samples]
+            elif a_wave.shape[1] < target_samples:
+                pad = torch.zeros((ch, target_samples - a_wave.shape[1]), dtype=a_wave.dtype)
+                a_wave = torch.cat([a_wave, pad], dim=1)
+
+            a_codec = "libopus" if is_webm else "aac"
+            target_rate = 48000 if is_webm else (a_sr if a_sr in (44100, 48000) else 44100)
+            a_stream = container.add_stream(a_codec, rate=target_rate)
+            layout = "stereo" if ch == 2 else "mono"
+
+            resampler = av.AudioResampler(
+                format=a_stream.format.name,
+                layout=layout,
+                rate=target_rate,
+                frame_size=a_stream.frame_size or 1024,
+            )
+            raw_aframe = av.AudioFrame.from_ndarray(
+                np.ascontiguousarray(a_wave.numpy()), format="fltp", layout=layout
+            )
+            raw_aframe.sample_rate = a_sr
+            return a_stream, resampler, raw_aframe
+        except Exception as a_err:
+            logger.error(f"[VideoCombine] Audio setup failed, continuing without audio: {a_err}")
+            return None, None, None
+
+    @staticmethod
+    def _encode_audio(container, a_stream, resampler, raw_aframe):
+        try:
+            audio_pts = 0
+            for rframe in resampler.resample(raw_aframe):
+                rframe.pts = audio_pts
+                audio_pts += rframe.samples
+                for packet in a_stream.encode(rframe):
+                    container.mux(packet)
+            for rframe in resampler.resample(None):
+                rframe.pts = audio_pts
+                audio_pts += rframe.samples
+                for packet in a_stream.encode(rframe):
+                    container.mux(packet)
+            for packet in a_stream.encode():
+                container.mux(packet)
+        except Exception as a_enc_err:
+            logger.error(f"[VideoCombine] Audio encode error: {a_enc_err}")
+
     def combine_video(
         self,
         frame_rate=8,
@@ -933,109 +1153,69 @@ class VideoCombine:
         extra_pnginfo=None,
         **kwargs,
     ):
-        # 1. System RAM & Device Cleanup at Node Entry
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
         if latents is not None:
             images = latents
         if images is None:
-            logger.warn("[VideoCombine] No images provided.")
+            logger.warning("[VideoCombine] No images provided.")
             return ((save_output, []),)
 
         bio = io.BytesIO()
         plaintext_view = None
+        container = None
+        source = None
+        raw_aframe = None
+        bin_path = None
 
         try:
-            # 2. Device-Agnostic Input Normalization: Pull 100% to CPU System RAM
+            # 1. Input normalization -> virtual frame source (no torch.cat, no CPU round-trip).
             if isinstance(images, dict) and "samples" in images:
-                if vae is not None:
-                    vae_dev = getattr(vae, "device", None) or getattr(vae, "load_device", None) or torch.device("cpu")
-                    images = vae.decode(images["samples"].to(vae_dev)).detach().to("cpu")
-                else:
+                if vae is None:
                     raise ValueError("[VideoCombine] Latents received but no VAE provided to decode.")
+                vae_dev = getattr(vae, "device", None) or getattr(vae, "load_device", None) or torch.device("cpu")
+                parts = [vae.decode(images["samples"].to(vae_dev)).detach()]
             elif isinstance(images, (list, tuple)):
-                cpu_chunks = []
-                for idx, chunk in enumerate(images):
-                    if isinstance(chunk, torch.Tensor):
-                        t = chunk.detach().to("cpu")
-                        cpu_chunks.append(t if t.ndim == 4 else t.unsqueeze(0))
-                    elif isinstance(chunk, np.ndarray):
-                        cpu_chunks.append(torch.from_numpy(chunk))
-                    else:
-                        logger.warn(f"[VideoCombine] Skipping unrecognized chunk index {idx}: {type(chunk)}")
-                if not cpu_chunks:
+                parts = list(images)
+            else:
+                parts = [images]
+
+            try:
+                source = _FrameSource(parts)
+            except ValueError as ve:
+                if "Empty image sequence" in str(ve):
                     logger.error("[VideoCombine] Empty image sequence after parsing chunks.")
                     return ((save_output, []),)
-                images = torch.cat(cpu_chunks, dim=0)
-                del cpu_chunks
-            elif isinstance(images, torch.Tensor):
-                images = images.detach().to("cpu")
-                if images.ndim == 3:
-                    images = images.unsqueeze(0)
+                raise
+            del parts
 
-            # 3. Quality-Preserving Quantization: Mathematically Exact Rounding Math
-            # Uses round(x * 255.0) instead of truncating cast to preserve full sRGB/BT.709 color fidelity
-            # No in-place mutation: original input tensors remain completely untouched upstream
-            images_u8 = torch.round(images.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-            del images
-            gc.collect()
-
-            # Sequence adjustments
-            if pingpong and images_u8.size(0) > 2:
-                images_u8 = torch.cat([images_u8, images_u8[1:-1].flip(dims=[0])], dim=0)
-
-            num_frames = images_u8.size(0)
             fps_float = float(frame_rate) if float(frame_rate) > 0 else 8.0
+            num_frames = source.total_frames(pingpong)
             total_duration = num_frames / fps_float
-
-            # Lossless 1-pixel boundary crop for odd codec alignments (no interpolation blur)
-            orig_h, orig_w = images_u8.shape[1], images_u8.shape[2]
-            height = orig_h - (orig_h % 2)
-            width = orig_w - (orig_w % 2)
-
+            height, width = source.height, source.width
             pbar = ProgressBar(num_frames)
 
-            # 4. In-RAM Encoding via On-The-Fly Per-Frame Slicing
-            if format == "image/gif":
-                mime_type = "image/gif"
-                first_frame = Image.fromarray(np.ascontiguousarray(images_u8[0, :height, :width, :3].numpy()))
+            # 2. In-RAM encoding: frames are quantized chunk-by-chunk straight into the encoder.
+            if format in ("image/gif", "image/webp"):
+                is_gif = format == "image/gif"
+                mime_type = format
+                frame_iter = source.frames(pingpong)
 
-                def gif_frame_iter():
-                    for i in range(1, num_frames):
+                # Pillow may keep a reference to the array, and our chunk buffer is reused -> copy.
+                first_frame = Image.fromarray(np.array(next(frame_iter)))
+                pbar.update(1)
+
+                def pil_frame_iter():
+                    for f in frame_iter:
                         pbar.update(1)
-                        yield Image.fromarray(np.ascontiguousarray(images_u8[i, :height, :width, :3].numpy()))
+                        yield Image.fromarray(np.array(f))
 
                 first_frame.save(
                     bio,
-                    format="GIF",
+                    format="GIF" if is_gif else "WEBP",
                     save_all=True,
-                    append_images=gif_frame_iter(),
+                    append_images=pil_frame_iter(),
                     duration=max(1, int(round(1000 / fps_float))),
                     loop=loop_count,
                 )
-                pbar.update(1)
-
-            elif format == "image/webp":
-                mime_type = "image/webp"
-                first_frame = Image.fromarray(np.ascontiguousarray(images_u8[0, :height, :width, :3].numpy()))
-
-                def webp_frame_iter():
-                    for i in range(1, num_frames):
-                        pbar.update(1)
-                        yield Image.fromarray(np.ascontiguousarray(images_u8[i, :height, :width, :3].numpy()))
-
-                first_frame.save(
-                    bio,
-                    format="WEBP",
-                    save_all=True,
-                    append_images=webp_frame_iter(),
-                    duration=max(1, int(round(1000 / fps_float))),
-                    loop=loop_count,
-                )
-                pbar.update(1)
-
             else:
                 is_webm = "webm" in format
                 container_fmt = "webm" if is_webm else "mp4"
@@ -1054,48 +1234,10 @@ class VideoCombine:
                 # Omit '+faststart' on in-memory BytesIO to prevent backward-seek corruption
                 v_stream.options = {"crf": "20", "preset": "fast", "threads": "4"}
 
-                # Audio Setup: Processed entirely on CPU preserving 1x duration
-                a_stream, resampler, raw_aframe = None, None, None
-                if audio is not None and isinstance(audio, dict) and "waveform" in audio:
-                    try:
-                        a_wave = audio["waveform"].detach().to("cpu")
-                        a_sr = int(audio.get("sample_rate", 44100))
-                        if a_wave.ndim == 3:
-                            a_wave = a_wave.squeeze(0)
+                a_stream, resampler, raw_aframe = self._setup_audio(container, audio, total_duration, is_webm)
 
-                        ch = min(2, a_wave.shape[0])
-                        a_wave = a_wave[:ch]
-
-                        target_samples = int(round(total_duration * a_sr))
-                        if a_wave.shape[1] > target_samples:
-                            a_wave = a_wave[:, :target_samples]
-                        elif a_wave.shape[1] < target_samples:
-                            pad = torch.zeros((ch, target_samples - a_wave.shape[1]), dtype=a_wave.dtype)
-                            a_wave = torch.cat([a_wave, pad], dim=1)
-
-                        a_codec = "libopus" if is_webm else "aac"
-                        target_rate = 48000 if is_webm else (a_sr if a_sr in (44100, 48000) else 44100)
-                        a_stream = container.add_stream(a_codec, rate=target_rate)
-                        layout = "stereo" if ch == 2 else "mono"
-
-                        resampler = av.AudioResampler(
-                            format=a_stream.format.name,
-                            layout=layout,
-                            rate=target_rate,
-                            frame_size=a_stream.frame_size or 1024,
-                        )
-                        raw_aframe = av.AudioFrame.from_ndarray(
-                            np.ascontiguousarray(a_wave.numpy()), format="fltp", layout=layout
-                        )
-                        raw_aframe.sample_rate = a_sr
-                    except Exception as a_err:
-                        logger.error(f"[VideoCombine] Audio setup failed, continuing without audio: {a_err}")
-                        a_stream, resampler, raw_aframe = None, None, None
-
-                # Video Encoding: Slices single frame on-the-fly (O(1) memory overhead, strictly C-contiguous)
-                for i in range(num_frames):
-                    f_slice = images_u8[i, :height, :width, :3].numpy()
-                    v_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(f_slice), format="rgb24")
+                for i, f in enumerate(source.frames(pingpong)):
+                    v_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(f), format="rgb24")
                     v_frame.pts = i
                     for packet in v_stream.encode(v_frame):
                         container.mux(packet)
@@ -1104,33 +1246,18 @@ class VideoCombine:
                 for packet in v_stream.encode():
                     container.mux(packet)
 
-                # Audio Encoding with Explicit Sample PTS
                 if a_stream is not None and resampler is not None and raw_aframe is not None:
-                    try:
-                        audio_pts = 0
-                        for rframe in resampler.resample(raw_aframe):
-                            rframe.pts = audio_pts
-                            audio_pts += rframe.samples
-                            for packet in a_stream.encode(rframe):
-                                container.mux(packet)
-                        for rframe in resampler.resample(None):
-                            rframe.pts = audio_pts
-                            audio_pts += rframe.samples
-                            for packet in a_stream.encode(rframe):
-                                container.mux(packet)
-                        for packet in a_stream.encode():
-                            container.mux(packet)
-                    except Exception as a_enc_err:
-                        logger.error(f"[VideoCombine] Audio encode error: {a_enc_err}")
+                    self._encode_audio(container, a_stream, resampler, raw_aframe)
 
                 container.close()
+                container = None
 
-            # Free raw frame buffer immediately before encryption
-            del images_u8
-            del raw_aframe
-            gc.collect()
+            # Raw-frame work buffers are no longer needed: zero + free before encryption.
+            source.close()
+            source = None
+            raw_aframe = None
 
-            # 5. Zero-Copy In-RAM Encryption & Direct Disk Streaming
+            # 3. In-RAM encryption (streaming AES-256-GCM) + direct disk streaming.
             browser_pubkey = extract_browser_public_key(extra_pnginfo, prompt)
             if browser_pubkey is None:
                 raise RuntimeError(
@@ -1138,14 +1265,10 @@ class VideoCombine:
                     "Please make sure the workflow was queued from an active browser tab."
                 )
 
-            # Access encoded container memory without duplicating bytearray
             plaintext_view = bio.getbuffer()
 
             aes_key = os.urandom(32)
             iv = os.urandom(12)
-            aesgcm = AESGCM(aes_key)
-            ciphertext = aesgcm.encrypt(iv, plaintext_view, None)
-
             wrapped_key = browser_pubkey.encrypt(
                 aes_key,
                 padding.OAEP(
@@ -1154,9 +1277,9 @@ class VideoCombine:
                     label=None,
                 ),
             )
+            encryptor = Cipher(algorithms.AES(aes_key), modes.GCM(iv)).encryptor()
             del aes_key
 
-            # Write .bin ciphertext directly without concatenating giant payload in RAM
             output_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
             full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
                 filename_prefix, output_dir
@@ -1166,13 +1289,17 @@ class VideoCombine:
             bin_filename = f"{filename}_{counter:05}.bin"
             bin_path = os.path.join(full_output_folder, bin_filename)
 
+            # File layout is unchanged: wrapped_key | iv | ciphertext | 16-byte GCM tag
+            # (identical to AESGCM.encrypt output, so WebCrypto decryption needs no change).
+            total_len = len(plaintext_view)
             with open(bin_path, "wb") as f:
                 f.write(wrapped_key)
                 f.write(iv)
-                f.write(ciphertext)
-
-            del ciphertext
-            del wrapped_key
+                for off in range(0, total_len, _IO_SLICE):
+                    f.write(encryptor.update(plaintext_view[off : off + _IO_SLICE]))
+                f.write(encryptor.finalize())
+                f.write(encryptor.tag)
+            del encryptor, wrapped_key
 
             preview_item = {
                 "filename": bin_filename,
@@ -1182,9 +1309,10 @@ class VideoCombine:
                 "frame_rate": fps_float,
             }
 
+            out_path, bin_path = bin_path, None  # success: keep the file
             return {
                 "ui": {"ram_preview": [preview_item]},
-                "result": ((save_output, [bin_path]),),
+                "result": ((save_output, [out_path]),),
             }
 
         except Exception as e:
@@ -1192,9 +1320,21 @@ class VideoCombine:
             raise e
 
         finally:
-            # 6. Mandatory RAM Zeroization (agent.md Rule 3)
+            # 4. Mandatory RAM Zeroization (agent.md Rule 3)
+            if bin_path is not None:  # failed mid-write: never leave a partial .bin behind
+                try:
+                    os.remove(bin_path)
+                except OSError:
+                    pass
+            if source is not None:
+                source.close()
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:
+                    pass
             if plaintext_view is not None:
-                plaintext_view[:] = b"\x00" * len(plaintext_view)
+                _zeroize_view(plaintext_view)
                 plaintext_view.release()
             bio.close()
             gc.collect()
