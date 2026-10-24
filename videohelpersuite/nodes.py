@@ -1342,8 +1342,10 @@ class VideoCombine:
 # =====================================================================
 # 4. Save Node
 # =====================================================================
+import zipfile
+import time
 def _to_cpu(obj):
-    """Recursively moves tensors to CPU to avoid CUDA locks and cross-device mismatch."""
+    """Recursively moves tensors to CPU to prevent CUDA memory locking."""
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
     elif isinstance(obj, dict):
@@ -1354,27 +1356,41 @@ def _to_cpu(obj):
         return tuple(_to_cpu(v) for v in obj)
     return obj
 
-def _list_pt_files(prefix):
-    """Lists .pt files from output and input directories with agent.md default empty string."""
+def _list_storage_files(prefix):
+    """Lists .pt and .zip files from ComfyUI output and input directories."""
     found = []
     for directory in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
         if os.path.exists(directory):
             for file in os.listdir(directory):
-                if file.startswith(prefix) and file.endswith(".pt"):
+                if file.startswith(prefix) and file.endswith((".pt", ".zip")):
+                    found.append(file)
+                elif file.startswith("latcond_") and file.endswith(".zip"):
                     found.append(file)
     return [""] + sorted(list(set(found)))
 
 class VHS_LatentConditioningStorage:
+    DESCRIPTION = (
+        "Save and load Latent and Conditioning tensors.\n"
+        "• Save: Connect latent or conditioning to auto-save to disk.\n"
+        "• Upload: Drag and drop .pt or .zip files directly onto the node.\n"
+        "• Upload: latent file start with 'latent_' & conditioning file with 'cond_'.\n"
+        "• Download: Right-click node -> 'Download (Compressed Zip)'."
+    )
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # Dropdown widgets on the node face (no extra input sockets)
-                "latent_file": (_list_pt_files("latent_"), {"default": ""}),
-                "cond_file": (_list_pt_files("cond_"), {"default": ""}),
+                "latent_file": (
+                    _list_storage_files("latent_"),
+                    {"default": "", "tooltip": "Select a latent file or drop a .pt/.zip file here."}
+                ),
+                "cond_file": (
+                    _list_storage_files("cond_"),
+                    {"default": "", "tooltip": "Select a conditioning file or drop a .pt/.zip file here."}
+                ),
             },
             "optional": {
-                # Strictly ONLY these two input sockets
                 "latent": ("LATENT",),
                 "conditioning": ("CONDITIONING",),
             }
@@ -1383,40 +1399,57 @@ class VHS_LatentConditioningStorage:
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
     FUNCTION = "process"
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/storage"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     OUTPUT_NODE = True
 
     def process(self, latent_file="", cond_file="", latent=None, conditioning=None):
         out_latent = None
         out_cond = None
         ui_updates = {}
+        out_dir = folder_paths.get_output_directory()
+        files_to_compress = []
+
+        # Simple timestamp shared by all files generated in this run
+        ts = int(time.time())
 
         # --- Latent Handler ---
         if latent is not None:
-            # Save: simple sequential name (latent_00001_.pt)
-            out_dir = folder_paths.get_output_directory()
-            folder, filename, counter, _, _ = folder_paths.get_save_image_path("latent", out_dir)
-            target_name = f"{filename}_{counter:05}_.pt"
-            self._atomic_save(_to_cpu(latent), os.path.join(folder, target_name))
+            target_name = f"latent_{ts}.pt"
+            filepath = os.path.join(out_dir, target_name)
+            self._atomic_save(_to_cpu(latent), filepath)
             out_latent = latent
             ui_updates["latent_file"] = [target_name]
+            files_to_compress.append((filepath, target_name))
         elif latent_file and latent_file.strip():
-            # Load
-            data = self._load_file(latent_file.strip())
+            data = self._load_file(latent_file.strip(), expected_type="latent")
             out_latent = data if (isinstance(data, dict) and "samples" in data) else {"samples": data}
 
         # --- Conditioning Handler ---
         if conditioning is not None:
-            # Save: simple sequential name (cond_00001_.pt)
-            out_dir = folder_paths.get_output_directory()
-            folder, filename, counter, _, _ = folder_paths.get_save_image_path("cond", out_dir)
-            target_name = f"{filename}_{counter:05}_.pt"
-            self._atomic_save(_to_cpu(conditioning), os.path.join(folder, target_name))
+            target_name = f"cond_{ts}.pt"
+            filepath = os.path.join(out_dir, target_name)
+            self._atomic_save(_to_cpu(conditioning), filepath)
             out_cond = conditioning
             ui_updates["cond_file"] = [target_name]
+            files_to_compress.append((filepath, target_name))
         elif cond_file and cond_file.strip():
-            # Load
-            out_cond = self._load_file(cond_file.strip())
+            out_cond = self._load_file(cond_file.strip(), expected_type="cond")
+
+        # --- Compress Both Files Into One Single .zip ---
+        if files_to_compress:
+            zip_filename = f"latcond_{ts}.zip"
+            zip_filepath = os.path.join(out_dir, zip_filename)
+            tmp_zip = zip_filepath + ".tmp"
+
+            with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for full_path, arc_name in files_to_compress:
+                    zf.write(full_path, arcname=arc_name)
+
+            if os.path.exists(zip_filepath):
+                os.remove(zip_filepath)
+            os.replace(tmp_zip, zip_filepath)
+
+            ui_updates["zip_file"] = [zip_filename]
 
         return {"ui": ui_updates, "result": (out_latent, out_cond)}
 
@@ -1434,14 +1467,31 @@ class VHS_LatentConditioningStorage:
                     pass
 
     @staticmethod
-    def _load_file(filename):
+    def _load_file(filename, expected_type=None):
         for base in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
             target = os.path.join(base, filename)
             if os.path.isfile(target):
-                try:
-                    return torch.load(target, map_location="cpu", weights_only=False)
-                except TypeError:
-                    return torch.load(target, map_location="cpu")
+                if filename.endswith(".zip"):
+                    with zipfile.ZipFile(target, "r") as zf:
+                        names = zf.namelist()
+                        target_name = None
+                        if expected_type:
+                            target_name = next((n for n in names if expected_type in n.lower() and n.endswith(".pt")), None)
+                        if not target_name:
+                            target_name = next((n for n in names if n.endswith(".pt")), None)
+
+                        if target_name:
+                            with zf.open(target_name) as f:
+                                try:
+                                    return torch.load(f, map_location="cpu", weights_only=False)
+                                except TypeError:
+                                    return torch.load(f, map_location="cpu")
+                else:
+                    try:
+                        return torch.load(target, map_location="cpu", weights_only=False)
+                    except TypeError:
+                        return torch.load(target, map_location="cpu")
+
         raise FileNotFoundError(f"[Storage Node] Could not locate file: {filename}")
 
 # =====================================================================

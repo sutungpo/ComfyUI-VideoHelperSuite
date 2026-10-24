@@ -21,25 +21,29 @@ async function uploadAndAssignFile(node, file) {
     const data = await res.json();
     const uploadedName = data.name;
 
-    // Track that this file is located in the 'input' folder
     node._fileTypes = node._fileTypes || {};
     node._fileTypes[uploadedName] = "input";
 
     const lowerName = uploadedName.toLowerCase();
-    let targetWidget = null;
+    const latentWidget = node.widgets?.find(w => w.name === "latent_file");
+    const condWidget = node.widgets?.find(w => w.name === "cond_file");
 
-    // Prefix recognition: route to latent or cond widget
-    if (lowerName.includes("latent")) {
-        targetWidget = node.widgets?.find(w => w.name === "latent_file");
-    } else if (lowerName.includes("cond")) {
-        targetWidget = node.widgets?.find(w => w.name === "cond_file");
-    }
-
-    if (targetWidget) {
-        if (targetWidget.options?.values && !targetWidget.options.values.includes(uploadedName)) {
-            targetWidget.options.values.push(uploadedName);
-        }
-        targetWidget.value = uploadedName;
+    if (lowerName.endsWith(".zip")) {
+        // Dropping a zip assigns it to both widgets (the backend inspects both inside the zip)
+        [latentWidget, condWidget].forEach(w => {
+            if (w) {
+                if (w.options?.values && !w.options.values.includes(uploadedName)) {
+                    w.options.values.push(uploadedName);
+                }
+                w.value = uploadedName;
+            }
+        });
+    } else if (lowerName.includes("latent") && latentWidget) {
+        if (!latentWidget.options.values.includes(uploadedName)) latentWidget.options.values.push(uploadedName);
+        latentWidget.value = uploadedName;
+    } else if (lowerName.includes("cond") && condWidget) {
+        if (!condWidget.options.values.includes(uploadedName)) condWidget.options.values.push(uploadedName);
+        condWidget.value = uploadedName;
     }
 }
 
@@ -49,12 +53,12 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage") return;
 
-        // 1. Drag & Drop Support
+        // 1. Drag & Drop Support (.pt and .zip)
         node.onDragOver = (e) => !!e?.dataTransfer?.types?.includes?.("Files");
 
         node.onDragDrop = async function (e) {
             if (!e?.dataTransfer?.types?.includes?.("Files")) return false;
-            const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith(".pt"));
+            const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith(".pt") || f.name.endsWith(".zip"));
             if (!files.length) return false;
 
             try {
@@ -70,28 +74,18 @@ app.registerExtension({
             }
         };
 
-        // 2. Right-Click Context Menu to Download Both
+        // 2. Right-Click Context Menu (Single Compressed Zip Download)
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
 
-            const latentFile = this.widgets?.find(w => w.name === "latent_file")?.value;
-            const condFile = this.widgets?.find(w => w.name === "cond_file")?.value;
-
-            if (latentFile || condFile) {
+            const zipFile = node._lastZipFile;
+            if (zipFile) {
                 options.push({
-                    content: "Download Latent & Conditioning",
+                    content: "Download (Compressed Zip)",
                     callback: () => {
-                        const downloads = [];
-                        if (latentFile) downloads.push({ name: latentFile, type: node._fileTypes?.[latentFile] || "output" });
-                        if (condFile) downloads.push({ name: condFile, type: node._fileTypes?.[condFile] || "output" });
-
-                        // Stagger downloads by 200ms so browsers do not drop concurrent files
-                        downloads.forEach((item, index) => {
-                            setTimeout(() => {
-                                downloadFile(item.name, item.type);
-                            }, index * 200);
-                        });
+                        const fileType = node._fileTypes?.[zipFile] || "output";
+                        downloadFile(zipFile, fileType);
                     }
                 });
             }
@@ -99,12 +93,15 @@ app.registerExtension({
     },
 
     setup() {
-        // Auto-update dropdowns when remote execution finishes saving
+        // Track the single zip file and update dropdowns when execution completes
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
             if (!node || (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage")) return;
 
             const ui = detail.output;
+            if (ui?.zip_file?.[0]) {
+                node._lastZipFile = ui.zip_file[0];
+            }
             if (ui?.latent_file?.[0]) {
                 const w = node.widgets?.find(w => w.name === "latent_file");
                 if (w) {
