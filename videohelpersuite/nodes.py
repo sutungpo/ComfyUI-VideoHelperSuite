@@ -1383,11 +1383,11 @@ class LatentConditioningStorage:
             "required": {
                 "latent_file": (
                     _list_storage_files("latent_"),
-                    {"default": "", "tooltip": "Select a latent file or drop a .pt/.zip file here."}
+                    {"default": "", "tooltip": "Select or drop a latent_*.pt/.zip file here."}
                 ),
                 "cond_file": (
                     _list_storage_files("cond_"),
-                    {"default": "", "tooltip": "Select a conditioning file or drop a .pt/.zip file here."}
+                    {"default": "", "tooltip": "Select or drop a cond_*.pt/.zip file here."}
                 ),
             },
             "optional": {
@@ -1399,7 +1399,7 @@ class LatentConditioningStorage:
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
     FUNCTION = "process"
-    "Video Helper Suite 🎥🅥🅗🅢"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     OUTPUT_NODE = True
 
     def process(self, latent_file="", cond_file="", latent=None, conditioning=None):
