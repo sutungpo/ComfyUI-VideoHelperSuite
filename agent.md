@@ -26,8 +26,11 @@ KEY ARCHITECTURE & FILE STRUCTURE:
 
 CORE RULES & CONVENTIONS:
 1. Do Not Overcomplicate: Prefer minimal, targeted line diffs over complex wrappers.
-2. Zero Cloud Disk Plaintext: Input media must only land as .bin ciphertext.
-3. Mandatory RAM Zeroization: Always zero-fill and delete decrypted/plaintext buffers in
+2. Design by Contract: Adhere strictly to host framework lifecycle contracts and API specifications.
+3. Idiomatic Platform Alignment: Favor the host platform's native patterns and built-in workflows over custom
+   reinventions. Do not fight the platform.
+4. Zero Cloud Disk Plaintext: Input media must only land as .bin ciphertext.
+5. Mandatory RAM Zeroization: Always zero-fill and delete decrypted/plaintext buffers in
    a finally block. Zero-fill in 1 MiB slices from a preallocated zero block, never
    with a full-size temporary (b"\x00" * len(buf) allocates a second copy):
        finally:
@@ -37,8 +40,8 @@ CORE RULES & CONVENTIONS:
                _zeroize_view(plaintext_view)   # chunked zero-fill of the encoded buffer
                plaintext_view.release()
            bio.close()
-4. Decouple from VHS Server Previews: Never request /vhs/viewvideo on .bin files.
-5. Strict API Compliance: Output standard tensors and ComfyUI V2 native objects.
+6. Decouple from VHS Server Previews: Never request /vhs/viewvideo on .bin files.
+7. Strict API Compliance: Output standard tensors and ComfyUI V2 native objects.
 
 CRITICAL DESIGN DECISIONS (DO NOT ALTER WITHOUT REASON):
 - Chunked Streaming Pipeline for VideoCombine (replaces the old "Pure System RAM /
