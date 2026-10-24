@@ -1,42 +1,8 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-function triggerUpload(node, widget) {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".pt";
-    input.onchange = async () => {
-        if (!input.files?.length) return;
-        const file = input.files[0];
-
-        const formData = new FormData();
-        formData.append("image", file, file.name);
-        formData.append("overwrite", "true");
-
-        try {
-            const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
-            if (!res.ok) throw new Error(`Upload failed with status ${res.status}`);
-            const data = await res.json();
-
-            widget.value = data.name;
-            node._fileTypes = node._fileTypes || {};
-            node._fileTypes[data.name] = "input";
-            node.setDirtyCanvas?.(true, true);
-            app.graph?.setDirtyCanvas(true, true);
-        } catch (err) {
-            alert("Upload failed: " + err.message);
-        }
-    };
-    input.click();
-}
-
-function triggerDownload(node, widget, label) {
-    const filename = widget.value;
-    if (!filename) {
-        alert(`No ${label} file selected to download.`);
-        return;
-    }
-    const type = node._fileTypes?.[filename] || "output";
+function downloadFile(filename, type = "output") {
+    if (!filename) return;
     const a = document.createElement("a");
     a.href = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=${type}`);
     a.download = filename;
@@ -45,103 +11,36 @@ function triggerDownload(node, widget, label) {
     requestAnimationFrame(() => a.remove());
 }
 
-function createInlineFileWidget(node, name, label) {
-    const widget = {
-        name: name,
-        type: "custom",
-        value: "",
-        computeSize(width) {
-            return [width, 26];
-        },
-        draw(ctx, node, widget_width, y, H) {
-            const margin = 10;
-            const x = margin;
-            const w = widget_width - margin * 2;
+async function uploadAndAssignFile(node, file) {
+    const formData = new FormData();
+    formData.append("image", file, file.name);
+    formData.append("overwrite", "true");
 
-            // 1. Draw Background Box
-            ctx.fillStyle = "#1e1e1e";
-            ctx.strokeStyle = "#383838";
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.roundRect(x, y, w, H, [4]);
-            ctx.fill();
-            ctx.stroke();
+    const res = await api.fetchApi("/upload/image", { method: "POST", body: formData });
+    if (!res.ok) throw new Error(`Upload failed for ${file.name}`);
+    const data = await res.json();
+    const uploadedName = data.name;
 
-            // 2. Draw Label & Current File Name
-            ctx.font = "11px sans-serif";
-            ctx.textAlign = "left";
-            ctx.textBaseline = "middle";
+    // Track that this file is located in the 'input' folder
+    node._fileTypes = node._fileTypes || {};
+    node._fileTypes[uploadedName] = "input";
 
-            ctx.fillStyle = "#888";
-            ctx.fillText(label + ":", x + 8, y + H / 2);
+    const lowerName = uploadedName.toLowerCase();
+    let targetWidget = null;
 
-            const labelWidth = ctx.measureText(label + ":").width + 8;
-            ctx.fillStyle = this.value ? "#ddd" : "#555";
-            const text = this.value || "(empty)";
+    // Prefix recognition: route to latent or cond widget
+    if (lowerName.includes("latent")) {
+        targetWidget = node.widgets?.find(w => w.name === "latent_file");
+    } else if (lowerName.includes("cond")) {
+        targetWidget = node.widgets?.find(w => w.name === "cond_file");
+    }
 
-            // Truncate text if it approaches the buttons on the right
-            const maxTextW = w - labelWidth - 52;
-            let displayText = text;
-            if (ctx.measureText(displayText).width > maxTextW) {
-                while (displayText.length > 3 && ctx.measureText(displayText + "...").width > maxTextW) {
-                    displayText = displayText.slice(0, -1);
-                }
-                displayText += "...";
-            }
-            ctx.fillText(displayText, x + labelWidth + 4, y + H / 2);
-
-            // 3. Draw Inline [ ⬆ ] Button
-            const upX = x + w - 44;
-            const btnY = y + 3;
-            const btnH = H - 6;
-            ctx.fillStyle = "#2a2a2a";
-            ctx.beginPath();
-            ctx.roundRect(upX, btnY, 18, btnH, [3]);
-            ctx.fill();
-            ctx.fillStyle = "#4af";
-            ctx.textAlign = "center";
-            ctx.font = "12px sans-serif";
-            ctx.fillText("⬆", upX + 9, y + H / 2);
-
-            // 4. Draw Inline [ ⬇ ] Button
-            const downX = x + w - 22;
-            ctx.fillStyle = "#2a2a2a";
-            ctx.beginPath();
-            ctx.roundRect(downX, btnY, 18, btnH, [3]);
-            ctx.fill();
-            ctx.fillStyle = "#4f8";
-            ctx.fillText("⬇", downX + 9, y + H / 2);
-        },
-        mouse(event, [mx, my], node) {
-            if (event.type === "pointerdown" || event.type === "mousedown") {
-                const margin = 10;
-                const x = margin;
-                const w = (this.width || node.size[0]) - margin * 2;
-                const upX = x + w - 44;
-                const downX = x + w - 22;
-
-                if (mx >= upX && mx <= upX + 18) {
-                    // Clicked ⬆ Upload
-                    triggerUpload(node, this);
-                    return true;
-                } else if (mx >= downX && mx <= downX + 18) {
-                    // Clicked ⬇ Download
-                    triggerDownload(node, this, label);
-                    return true;
-                } else if (mx >= x && mx < upX) {
-                    // Clicked the file name text area: quick prompt to edit/view
-                    app.canvas.prompt("File name:", this.value, (val) => {
-                        this.value = val.trim();
-                        node.setDirtyCanvas?.(true, true);
-                    });
-                    return true;
-                }
-            }
+    if (targetWidget) {
+        if (targetWidget.options?.values && !targetWidget.options.values.includes(uploadedName)) {
+            targetWidget.options.values.push(uploadedName);
         }
-    };
-
-    node.addCustomWidget(widget);
-    return widget;
+        targetWidget.value = uploadedName;
+    }
 }
 
 app.registerExtension({
@@ -150,19 +49,57 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage") return;
 
-        // Clear default widgets if any were auto-generated
-        node.widgets = [];
+        // 1. Drag & Drop Support
+        node.onDragOver = (e) => !!e?.dataTransfer?.types?.includes?.("Files");
 
-        // Create the two compact rows with inline ⬆ / ⬇
-        createInlineFileWidget(node, "latent_file", "Latent");
-        createInlineFileWidget(node, "cond_file", "Cond");
+        node.onDragDrop = async function (e) {
+            if (!e?.dataTransfer?.types?.includes?.("Files")) return false;
+            const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith(".pt"));
+            if (!files.length) return false;
 
-        node.setSize(node.computeSize());
-        node.setDirtyCanvas?.(true, true);
+            try {
+                for (const file of files) {
+                    await uploadAndAssignFile(node, file);
+                }
+                node.setDirtyCanvas?.(true, true);
+                app.graph?.setDirtyCanvas(true, true);
+                return true;
+            } catch (err) {
+                alert(err.message);
+                return false;
+            }
+        };
+
+        // 2. Right-Click Context Menu to Download Both
+        const origGetExtraMenuOptions = node.getExtraMenuOptions;
+        node.getExtraMenuOptions = function (canvas, options) {
+            origGetExtraMenuOptions?.apply(this, arguments);
+
+            const latentFile = this.widgets?.find(w => w.name === "latent_file")?.value;
+            const condFile = this.widgets?.find(w => w.name === "cond_file")?.value;
+
+            if (latentFile || condFile) {
+                options.push({
+                    content: "Download Latent & Conditioning",
+                    callback: () => {
+                        const downloads = [];
+                        if (latentFile) downloads.push({ name: latentFile, type: node._fileTypes?.[latentFile] || "output" });
+                        if (condFile) downloads.push({ name: condFile, type: node._fileTypes?.[condFile] || "output" });
+
+                        // Stagger downloads by 200ms so browsers do not drop concurrent files
+                        downloads.forEach((item, index) => {
+                            setTimeout(() => {
+                                downloadFile(item.name, item.type);
+                            }, index * 200);
+                        });
+                    }
+                });
+            }
+        };
     },
 
     setup() {
-        // Auto-update file names when workflow execution finishes saving
+        // Auto-update dropdowns when remote execution finishes saving
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
             if (!node || (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage")) return;
@@ -170,11 +107,19 @@ app.registerExtension({
             const ui = detail.output;
             if (ui?.latent_file?.[0]) {
                 const w = node.widgets?.find(w => w.name === "latent_file");
-                if (w) w.value = ui.latent_file[0];
+                if (w) {
+                    const name = ui.latent_file[0];
+                    if (!w.options.values.includes(name)) w.options.values.push(name);
+                    w.value = name;
+                }
             }
             if (ui?.cond_file?.[0]) {
                 const w = node.widgets?.find(w => w.name === "cond_file");
-                if (w) w.value = ui.cond_file[0];
+                if (w) {
+                    const name = ui.cond_file[0];
+                    if (!w.options.values.includes(name)) w.options.values.push(name);
+                    w.value = name;
+                }
             }
             node.setDirtyCanvas?.(true, true);
             app.graph?.setDirtyCanvas(true, true);

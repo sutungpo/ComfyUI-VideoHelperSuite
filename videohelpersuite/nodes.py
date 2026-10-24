@@ -1343,7 +1343,7 @@ class VideoCombine:
 # 4. Save Node
 # =====================================================================
 def _to_cpu(obj):
-    """Recursively moves tensors to CPU to avoid CUDA locks and device mismatch."""
+    """Recursively moves tensors to CPU to avoid CUDA locks and cross-device mismatch."""
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
     elif isinstance(obj, dict):
@@ -1354,19 +1354,29 @@ def _to_cpu(obj):
         return tuple(_to_cpu(v) for v in obj)
     return obj
 
+def _list_pt_files(prefix):
+    """Lists .pt files from output and input directories with agent.md default empty string."""
+    found = []
+    for directory in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
+        if os.path.exists(directory):
+            for file in os.listdir(directory):
+                if file.startswith(prefix) and file.endswith(".pt"):
+                    found.append(file)
+    return [""] + sorted(list(set(found)))
+
 class VHS_LatentConditioningStorage:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {},
+            "required": {
+                # Dropdown widgets on the node face (no extra input sockets)
+                "latent_file": (_list_pt_files("latent_"), {"default": ""}),
+                "cond_file": (_list_pt_files("cond_"), {"default": ""}),
+            },
             "optional": {
                 # Strictly ONLY these two input sockets
                 "latent": ("LATENT",),
                 "conditioning": ("CONDITIONING",),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
-                "prompt": "PROMPT",
             }
         }
 
@@ -1376,12 +1386,7 @@ class VHS_LatentConditioningStorage:
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢/storage"
     OUTPUT_NODE = True
 
-    def process(self, latent=None, conditioning=None, unique_id=None, prompt=None, **kwargs):
-        # Retrieve widget values directly from workflow prompt without exposing extra sockets
-        node_inputs = prompt.get(str(unique_id), {}).get("inputs", {}) if prompt else {}
-        latent_file = kwargs.get("latent_file", node_inputs.get("latent_file", ""))
-        cond_file = kwargs.get("cond_file", node_inputs.get("cond_file", ""))
-
+    def process(self, latent_file="", cond_file="", latent=None, conditioning=None):
         out_latent = None
         out_cond = None
         ui_updates = {}
