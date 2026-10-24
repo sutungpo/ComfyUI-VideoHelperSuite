@@ -17,17 +17,19 @@ function arrayBufferToPem(buffer, header) {
 
 async function ensureBrowserKeys() {
     if (!browserKeyPair) {
+        // Must include both private and public usages so JWK key_ops is populated correctly
         browserKeyPair = await window.crypto.subtle.generateKey(
             { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
             true,
-            ["unwrapKey", "decrypt"]
+            ["unwrapKey", "decrypt", "wrapKey", "encrypt"]
         );
         const spki = await window.crypto.subtle.exportKey("spki", browserKeyPair.publicKey);
         browserPublicKeyPEM = arrayBufferToPem(spki, "PUBLIC KEY");
     }
     return browserPublicKeyPEM;
 }
-// --- Key Export & Import Helpers ---
+
+// --- Key Export & Import Helpers (Right-Click Menu) ---
 async function exportBrowserKey() {
     await ensureBrowserKeys();
     if (!browserKeyPair) return;
@@ -69,6 +71,10 @@ function importBrowserKey() {
                 throw new Error("Invalid key file: missing public or private key structure.");
             }
 
+            // Strip key_ops to bypass strict subset conflict during WebCrypto import
+            delete data.privateKey.key_ops;
+            delete data.publicKey.key_ops;
+
             const privateKey = await window.crypto.subtle.importKey(
                 "jwk",
                 data.privateKey,
@@ -81,7 +87,7 @@ function importBrowserKey() {
                 data.publicKey,
                 { name: "RSA-OAEP", hash: "SHA-256" },
                 true,
-                ["wrapKey"]
+                ["wrapKey", "encrypt"]
             );
 
             // Replace active session keys in RAM
@@ -318,7 +324,6 @@ app.registerExtension({
 
             try {
                 const item = items[0];
-                // Save preview metadata into node state for the refresh button
                 node.ramPreviewItem = item;
                 node.properties = node.properties || {};
                 node.properties["last_ram_preview"] = item;
@@ -449,7 +454,7 @@ app.registerExtension({
             };
         }
 
-        // Context menu options for saving decrypted media and managing keys
+        // Context menu options for saving decrypted media and managing keys (Right-Click Menu)
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
@@ -477,11 +482,11 @@ app.registerExtension({
                 }
             }
 
-            // Expose Key Management options on all encryption/preview nodes
+            // Expose Key Management in right-click context menu
             if (isImagePreview || isVideoCombine || isImage || isLoadVideo) {
                 if (!options.some(opt => opt?.content === "Export Browser Encryption Key")) {
                     options.push(
-                        null, // visual divider in litegraph context menu
+                        null,
                         { content: "Export Browser Encryption Key", callback: exportBrowserKey },
                         { content: "Import Browser Encryption Key", callback: importBrowserKey }
                     );
