@@ -1342,10 +1342,9 @@ class VideoCombine:
 # =====================================================================
 # 4. Save Node
 # =====================================================================
-import zipfile
 import time
+import zipfile
 def _to_cpu(obj):
-    """Recursively moves tensors to CPU to prevent CUDA memory locking."""
     if isinstance(obj, torch.Tensor):
         return obj.detach().cpu()
     elif isinstance(obj, dict):
@@ -1357,7 +1356,6 @@ def _to_cpu(obj):
     return obj
 
 def _list_storage_files(prefix):
-    """Lists .pt and .zip files from ComfyUI output and input directories."""
     found = []
     for directory in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
         if os.path.exists(directory):
@@ -1368,13 +1366,13 @@ def _list_storage_files(prefix):
                     found.append(file)
     return [""] + sorted(list(set(found)))
 
-class VHS_LatentConditioningStorage:
+# Class name without "VHS_" prefix prevents VHS.core.js from truncating description
+class LatentConditioningStorage:
     DESCRIPTION = (
         "Save and load Latent and Conditioning tensors.\n"
         "• Save: Connect latent or conditioning to auto-save to disk.\n"
         "• Upload: Drag and drop .pt or .zip files directly onto the node.\n"
-        "• Upload: latent file start with 'latent_' & conditioning file with 'cond_'.\n"
-        "• Download: Right-click node -> 'Download (Compressed Zip)'."
+        "• Download: Right-click node -> 'Download Latent & Conditioning'."
     )
 
     @classmethod
@@ -1383,11 +1381,11 @@ class VHS_LatentConditioningStorage:
             "required": {
                 "latent_file": (
                     _list_storage_files("latent_"),
-                    {"default": "", "tooltip": "Select a latent file or drop a .pt/.zip file here."}
+                    {"default": "", "tooltip": "Drop a latent_*.pt or .zip file here."}
                 ),
                 "cond_file": (
                     _list_storage_files("cond_"),
-                    {"default": "", "tooltip": "Select a conditioning file or drop a .pt/.zip file here."}
+                    {"default": "", "tooltip": "Drop a cond_*.pt or .zip file here."}
                 ),
             },
             "optional": {
@@ -1399,7 +1397,7 @@ class VHS_LatentConditioningStorage:
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
     FUNCTION = "process"
-    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    CATEGORY = "latent/conditioning"
     OUTPUT_NODE = True
 
     def process(self, latent_file="", cond_file="", latent=None, conditioning=None):
@@ -1409,7 +1407,6 @@ class VHS_LatentConditioningStorage:
         out_dir = folder_paths.get_output_directory()
         files_to_compress = []
 
-        # Simple timestamp shared by all files generated in this run
         ts = int(time.time())
 
         # --- Latent Handler ---
@@ -1435,7 +1432,7 @@ class VHS_LatentConditioningStorage:
         elif cond_file and cond_file.strip():
             out_cond = self._load_file(cond_file.strip(), expected_type="cond")
 
-        # --- Compress Both Files Into One Single .zip ---
+        # --- Bundle into single .zip archive ---
         if files_to_compress:
             zip_filename = f"latcond_{ts}.zip"
             zip_filepath = os.path.join(out_dir, zip_filename)
@@ -1520,7 +1517,7 @@ NODE_CLASS_MAPPINGS = {
     "VHS_LoadVideo": LoadVideoUpload,
     "VHS_ImageUploadRAM": VHS_ImageUploadRAM,
     "VHS_ImagePreviewRAM": VHS_ImagePreviewRAM,
-    "VHS_LatentConditioningStorage": VHS_LatentConditioningStorage,
+    "VHS_LatentConditioningStorage": LatentConditioningStorage,
     "VHS_RestartSignal": RestartSignal,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadVideoFFmpeg": LoadVideoFFmpegUpload,

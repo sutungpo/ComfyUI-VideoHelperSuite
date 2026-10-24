@@ -47,19 +47,22 @@ async function uploadAndAssignFile(node, file) {
 }
 
 app.registerExtension({
-    name: "ComfyUI.VHS.LatentConditioningStorage",
+    name: "ComfyUI.LatentConditioningStorage",
 
     nodeCreated(node) {
-        if (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage") return;
+        if (node.comfyClass !== "LatentConditioningStorage" && node.type !== "LatentConditioningStorage") return;
 
-        // Restore full multi-line hover tooltip (bypasses VHS.core.js single-line truncation)
-        node.tooltip = [
+        const fullDescription = [
             "Save and load Latent and Conditioning tensors.",
             "• Save: Connect latent or conditioning to auto-save to disk.",
             "• Upload: Drag and drop .pt or .zip files directly onto the node.",
-            "• Upload: latent file start with 'latent_' & conditioning file with 'cond_'.\n",
-            "• Download: Right-click node -> 'Download (Compressed Zip)'."
+            "• Upload: latent file start with 'latent_' & conditioning file with 'cond_'.",
+            "• Download: Right-click node -> 'Download Latent & Conditioning'."
         ].join("\n");
+
+        // Fix 1: Guarantee multi-line tooltip across all ComfyUI canvas / Vue modes
+        node.tooltip = fullDescription;
+        node.getTooltip = () => fullDescription;
 
         // Drag & Drop Support (.pt and .zip)
         node.onDragOver = (e) => !!e?.dataTransfer?.types?.includes?.("Files");
@@ -82,18 +85,33 @@ app.registerExtension({
             }
         };
 
-        // Right-Click Context Menu (Single Compressed Zip Download)
+        // Fix 2: Right-click context menu always present whenever files exist
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
 
             const zipFile = node._lastZipFile;
-            if (zipFile) {
+            const latentFile = this.widgets?.find(w => w.name === "latent_file")?.value;
+            const condFile = this.widgets?.find(w => w.name === "cond_file")?.value;
+
+            // Always provide the option if a zip exists OR if any file is selected in dropdowns
+            if (zipFile || latentFile || condFile) {
                 options.push({
-                    content: "Download (Compressed Zip)",
+                    content: "Download Latent & Conditioning",
                     callback: () => {
-                        const fileType = node._fileTypes?.[zipFile] || "output";
-                        downloadFile(zipFile, fileType);
+                        if (node._lastZipFile) {
+                            const fileType = node._fileTypes?.[node._lastZipFile] || "output";
+                            downloadFile(node._lastZipFile, fileType);
+                        } else {
+                            // If no zip was created in this run, download whichever file(s) are selected
+                            const toDownload = [];
+                            if (latentFile) toDownload.push({ name: latentFile, type: node._fileTypes?.[latentFile] || "output" });
+                            if (condFile) toDownload.push({ name: condFile, type: node._fileTypes?.[condFile] || "output" });
+
+                            toDownload.forEach((item, idx) => {
+                                setTimeout(() => downloadFile(item.name, item.type), idx * 200);
+                            });
+                        }
                     }
                 });
             }
@@ -103,7 +121,7 @@ app.registerExtension({
     setup() {
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
-            if (!node || (node.comfyClass !== "VHS_LatentConditioningStorage" && node.type !== "VHS_LatentConditioningStorage")) return;
+            if (!node || (node.comfyClass !== "LatentConditioningStorage" && node.type !== "LatentConditioningStorage")) return;
 
             const ui = detail.output;
             if (ui?.zip_file?.[0]) {
