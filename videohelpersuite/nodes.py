@@ -1342,6 +1342,108 @@ class VideoCombine:
 # =====================================================================
 # 4. Restart Node
 # =====================================================================
+def _to_cpu(obj):
+    """Recursively moves all tensors to CPU to prevent CUDA memory locks and device mismatch."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    elif isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_to_cpu(v) for v in obj)
+    return obj
+
+def _list_pt_files(prefix):
+    """Lists .pt files matching the prefix from output and input folders."""
+    found = []
+    for directory in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
+        if os.path.exists(directory):
+            for file in os.listdir(directory):
+                if file.startswith(prefix) and file.endswith(".pt"):
+                    found.append(file)
+    return sorted(list(set(found)))
+
+class VHS_LatentConditioningStorage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        # agent.md rule: default empty string to avoid accidental auto-selection
+        latent_files = [""] + _list_pt_files("latent_")
+        cond_files = [""] + _list_pt_files("cond_")
+        return {
+            "required": {},
+            "optional": {
+                "latent": ("LATENT",),
+                "conditioning": ("CONDITIONING",),
+                "latent_file": (latent_files, {"default": ""}),
+                "cond_file": (cond_files, {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "CONDITIONING")
+    RETURN_NAMES = ("latent", "conditioning")
+    FUNCTION = "process"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+    OUTPUT_NODE = True
+
+    def process(self, latent=None, conditioning=None, latent_file="", cond_file=""):
+        out_latent = None
+        out_cond = None
+        ui_updates = {}
+
+        # --- Latent Item ---
+        if latent is not None:
+            # Save: simple sequential name (latent_00001_.pt)
+            out_dir = folder_paths.get_output_directory()
+            folder, filename, counter, _, _ = folder_paths.get_save_image_path("latent", out_dir)
+            target_name = f"{filename}_{counter:05}_.pt"
+            self._atomic_save(_to_cpu(latent), os.path.join(folder, target_name))
+            out_latent = latent
+            ui_updates["latent_file"] = [target_name]
+        elif latent_file and latent_file.strip():
+            # Load
+            data = self._load_file(latent_file.strip())
+            out_latent = data if (isinstance(data, dict) and "samples" in data) else {"samples": data}
+
+        # --- Conditioning Item ---
+        if conditioning is not None:
+            # Save: simple sequential name (cond_00001_.pt)
+            out_dir = folder_paths.get_output_directory()
+            folder, filename, counter, _, _ = folder_paths.get_save_image_path("cond", out_dir)
+            target_name = f"{filename}_{counter:05}_.pt"
+            self._atomic_save(_to_cpu(conditioning), os.path.join(folder, target_name))
+            out_cond = conditioning
+            ui_updates["cond_file"] = [target_name]
+        elif cond_file and cond_file.strip():
+            # Load
+            out_cond = self._load_file(cond_file.strip())
+
+        return {"ui": ui_updates, "result": (out_latent, out_cond)}
+
+    @staticmethod
+    def _atomic_save(payload, filepath):
+        tmp_path = filepath + ".tmp"
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, filepath)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    @staticmethod
+    def _load_file(filename):
+        for base in [folder_paths.get_output_directory(), folder_paths.get_input_directory()]:
+            target = os.path.join(base, filename)
+            if os.path.isfile(target):
+                try:
+                    return torch.load(target, map_location="cpu", weights_only=False)
+                except TypeError:
+                    return torch.load(target, map_location="cpu")
+        raise FileNotFoundError(f"[Storage Node] Could not locate file: {filename}")
+
+# =====================================================================
+# 5. Restart Node
+# =====================================================================
 class RestartSignal:
     @classmethod
     def INPUT_TYPES(cls):
