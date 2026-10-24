@@ -1397,7 +1397,7 @@ class LatentConditioningStorage:
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
     FUNCTION = "process"
-    CATEGORY = "latent/conditioning"
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     OUTPUT_NODE = True
 
     def process(self, latent_file="", cond_file="", latent=None, conditioning=None):

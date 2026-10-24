@@ -50,25 +50,44 @@ app.registerExtension({
     name: "ComfyUI.LatentConditioningStorage",
 
     nodeCreated(node) {
-        if (node.comfyClass !== "LatentConditioningStorage" && node.type !== "LatentConditioningStorage") return;
+        // Support both naming formats
+        const isStorageNode = node.comfyClass === "LatentConditioningStorage" || 
+                              node.type === "LatentConditioningStorage" ||
+                              node.comfyClass === "VHS_LatentConditioningStorage" || 
+                              node.type === "VHS_LatentConditioningStorage";
+
+        if (!isStorageNode) return;
 
         const fullDescription = [
             "Save and load Latent and Conditioning tensors.",
             "• Save: Connect latent or conditioning to auto-save to disk.",
             "• Upload: Drag and drop .pt or .zip files directly onto the node.",
-            "• Upload: latent file start with 'latent_' & conditioning file with 'cond_'.",
             "• Download: Right-click node -> 'Download Latent & Conditioning'."
         ].join("\n");
 
-        // Fix 1: Guarantee multi-line tooltip across all ComfyUI canvas / Vue modes
         node.tooltip = fullDescription;
         node.getTooltip = () => fullDescription;
 
-        // Drag & Drop Support (.pt and .zip)
-        node.onDragOver = (e) => !!e?.dataTransfer?.types?.includes?.("Files");
+        // 1. VHS Pattern: Explicitly notify ComfyUI's core that this node is targeted
+        node.onDragOver = function (e) {
+            if (e?.dataTransfer?.types?.includes("Files")) {
+                e.preventDefault();
+                e.stopPropagation();
+                e.dataTransfer.dropEffect = "copy";
+                app.dragOverNode = node; // Tells ComfyUI app.ts exactly which node owns this drop
+                return true;
+            }
+            return false;
+        };
 
+        // 2. Returns true to fulfill ComfyUI's `if (await n?.onDragDrop?.(event)) return;`
         node.onDragDrop = async function (e) {
-            if (!e?.dataTransfer?.types?.includes?.("Files")) return false;
+            if (!e?.dataTransfer?.types?.includes("Files")) return false;
+
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+
             const files = Array.from(e.dataTransfer.files).filter(f => f.name.endsWith(".pt") || f.name.endsWith(".zip"));
             if (!files.length) return false;
 
@@ -78,14 +97,14 @@ app.registerExtension({
                 }
                 node.setDirtyCanvas?.(true, true);
                 app.graph?.setDirtyCanvas(true, true);
-                return true;
+                return true; // Signals ComfyUI to completely abort workflow loading
             } catch (err) {
                 alert(err.message);
-                return false;
+                return true; // Still return true so ComfyUI doesn't try loading as workflow on failure
             }
         };
 
-        // Fix 2: Right-click context menu always present whenever files exist
+        // 3. Right-Click Context Menu
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
@@ -94,7 +113,6 @@ app.registerExtension({
             const latentFile = this.widgets?.find(w => w.name === "latent_file")?.value;
             const condFile = this.widgets?.find(w => w.name === "cond_file")?.value;
 
-            // Always provide the option if a zip exists OR if any file is selected in dropdowns
             if (zipFile || latentFile || condFile) {
                 options.push({
                     content: "Download Latent & Conditioning",
@@ -103,7 +121,6 @@ app.registerExtension({
                             const fileType = node._fileTypes?.[node._lastZipFile] || "output";
                             downloadFile(node._lastZipFile, fileType);
                         } else {
-                            // If no zip was created in this run, download whichever file(s) are selected
                             const toDownload = [];
                             if (latentFile) toDownload.push({ name: latentFile, type: node._fileTypes?.[latentFile] || "output" });
                             if (condFile) toDownload.push({ name: condFile, type: node._fileTypes?.[condFile] || "output" });
@@ -121,7 +138,14 @@ app.registerExtension({
     setup() {
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
-            if (!node || (node.comfyClass !== "LatentConditioningStorage" && node.type !== "LatentConditioningStorage")) return;
+            if (!node) return;
+
+            const isStorageNode = node.comfyClass === "LatentConditioningStorage" || 
+                                  node.type === "LatentConditioningStorage" ||
+                                  node.comfyClass === "VHS_LatentConditioningStorage" || 
+                                  node.type === "VHS_LatentConditioningStorage";
+
+            if (!isStorageNode) return;
 
             const ui = detail.output;
             if (ui?.zip_file?.[0]) {
