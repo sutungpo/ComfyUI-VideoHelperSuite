@@ -1348,8 +1348,14 @@ from server import PromptServer
 from aiohttp import web
 
 def _to_cpu(obj):
+    """
+    Official ComfyUI device normalization:
+    - If on GPU: transfers to CPU for disk write.
+    - If already on CPU: views existing memory via detach() without copying.
+    - Upstream input tensors are NEVER modified in-place.
+    """
     if isinstance(obj, torch.Tensor):
-        return obj.detach().cpu()
+        return obj.detach() if not obj.is_cuda else obj.detach().cpu()
     elif isinstance(obj, dict):
         return {k: _to_cpu(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -1370,10 +1376,18 @@ def _list_storage_files(prefix):
     return [""] + sorted(list(set(found)))
 
 class LatentConditioningStorage:
+    """
+    Official ComfyUI Pass-Through and Side-Effect Save Node.
+    Follows docs.comfy.org specifications for Output Nodes.
+    """
+    def __init__(self):
+        # Official pattern: self only stores static paths, NEVER tensor state
+        self.output_dir = folder_paths.get_output_directory()
+
     DESCRIPTION = (
-        "Save and load Latent and Conditioning tensors.\n"
-        "• Save: Connect latent or conditioning to auto-save to disk.\n"
-        "• Upload: Drag and drop .pt or .zip files directly onto the node.\n"
+        "Pass-through node that saves Latent and Conditioning as a side-effect.\n"
+        "• Pass-Through: Tensors pass downstream 100% untouched (same device & dtype).\n"
+        "• Zero-RAM Duplication: If on CPU, no deep copy is made.\n"
         "• Download: Right-click node -> 'Download (Compressed Zip)'."
     )
 
@@ -1383,72 +1397,104 @@ class LatentConditioningStorage:
             "required": {
                 "latent_file": (
                     _list_storage_files("latent_"),
-                    {"default": "", "tooltip": "Select or drop a latent_*.pt/.zip file here."}
+                    {"default": "", "tooltip": "Optional: Loaded if latent input is not connected."}
                 ),
                 "cond_file": (
                     _list_storage_files("cond_"),
-                    {"default": "", "tooltip": "Select or drop a cond_*.pt/.zip file here."}
+                    {"default": "", "tooltip": "Optional: Loaded if conditioning input is not connected."}
                 ),
             },
             "optional": {
+                # Strictly pass-through sockets
                 "latent": ("LATENT",),
                 "conditioning": ("CONDITIONING",),
+            },
+            # Official ComfyUI hidden parameters for output/save nodes
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
             }
         }
 
     RETURN_TYPES = ("LATENT", "CONDITIONING")
     RETURN_NAMES = ("latent", "conditioning")
-    FUNCTION = "process"
+    FUNCTION = "save_and_pass"
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
-    OUTPUT_NODE = True
+    OUTPUT_NODE = True  # Required by docs for side-effect nodes
 
-    def process(self, latent_file="", cond_file="", latent=None, conditioning=None):
-        out_latent = None
-        out_cond = None
-        ui_updates = {}
-        out_dir = folder_paths.get_output_directory()
+    def save_and_pass(self, latent_file="", cond_file="", latent=None, conditioning=None, prompt=None, extra_pnginfo=None):
         files_to_compress = []
-
+        ui_updates = {}
         ts = int(time.time())
 
-        # --- Latent Handler ---
-        if latent is not None:
-            target_name = f"latent_{ts}.pt"
-            filepath = os.path.join(out_dir, target_name)
-            self._atomic_save(_to_cpu(latent), filepath)
-            out_latent = latent
-            ui_updates["latent_file"] = [target_name]
-            files_to_compress.append((filepath, target_name))
-        elif latent_file and latent_file.strip():
-            data = self._load_file(latent_file.strip(), expected_type="latent")
-            out_latent = data if (isinstance(data, dict) and "samples" in data) else {"samples": data}
+        latent_payload = None
+        cond_payload = None
+        loaded_latent = None
+        loaded_cond = None
 
-        # --- Conditioning Handler ---
-        if conditioning is not None:
-            target_name = f"cond_{ts}.pt"
-            filepath = os.path.join(out_dir, target_name)
-            self._atomic_save(_to_cpu(conditioning), filepath)
-            out_cond = conditioning
-            ui_updates["cond_file"] = [target_name]
-            files_to_compress.append((filepath, target_name))
-        elif cond_file and cond_file.strip():
-            out_cond = self._load_file(cond_file.strip(), expected_type="cond")
+        try:
+            # 1. LATENT: Pass-Through + Side-Effect Save
+            if latent is not None:
+                target_name = f"latent_{ts}.pt"
+                filepath = os.path.join(self.output_dir, target_name)
 
-        # --- Save zip archive to disk if saving ---
-        if files_to_compress:
-            zip_filename = f"latcond_{ts}.zip"
-            zip_filepath = os.path.join(out_dir, zip_filename)
-            tmp_zip = zip_filepath + ".tmp"
+                latent_payload = _to_cpu(latent)
+                self._atomic_save(latent_payload, filepath)
+                del latent_payload
+                latent_payload = None
 
-            with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for full_path, arc_name in files_to_compress:
-                    zf.write(full_path, arcname=arc_name)
+                ui_updates["latent_file"] = [target_name]
+                files_to_compress.append((filepath, target_name))
+                out_latent = latent  # Official Pass-Through: exact reference returned
+            elif latent_file and latent_file.strip():
+                loaded_latent = self._load_file(latent_file.strip(), expected_type="latent")
+                out_latent = loaded_latent if (isinstance(loaded_latent, dict) and "samples" in loaded_latent) else {"samples": loaded_latent}
+            else:
+                out_latent = None
 
-            if os.path.exists(zip_filepath):
-                os.remove(zip_filepath)
-            os.replace(tmp_zip, zip_filepath)
+            # 2. CONDITIONING: Pass-Through + Side-Effect Save
+            if conditioning is not None:
+                target_name = f"cond_{ts}.pt"
+                filepath = os.path.join(self.output_dir, target_name)
 
-        return {"ui": ui_updates, "result": (out_latent, out_cond)}
+                cond_payload = _to_cpu(conditioning)
+                self._atomic_save(cond_payload, filepath)
+                del cond_payload
+                cond_payload = None
+
+                ui_updates["cond_file"] = [target_name]
+                files_to_compress.append((filepath, target_name))
+                out_cond = conditioning  # Official Pass-Through: exact reference returned
+            elif cond_file and cond_file.strip():
+                loaded_cond = self._load_file(cond_file.strip(), expected_type="cond")
+                out_cond = loaded_cond
+            else:
+                out_cond = None
+
+            # 3. SIDE-EFFECT COMPRESSION (Single zip archive)
+            if files_to_compress:
+                zip_filename = f"latcond_{ts}.zip"
+                zip_filepath = os.path.join(self.output_dir, zip_filename)
+                tmp_zip = zip_filepath + ".tmp"
+
+                with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for full_path, arc_name in files_to_compress:
+                        zf.write(full_path, arcname=arc_name)
+
+                if os.path.exists(zip_filepath):
+                    os.remove(zip_filepath)
+                os.replace(tmp_zip, zip_filepath)
+
+            # Official ComfyUI execution return contract: (ui dict, output tuple)
+            return {"ui": ui_updates, "result": (out_latent, out_cond)}
+
+        finally:
+            # Ephemeral scope: drop all local payload references
+            del latent_payload
+            del cond_payload
+            del loaded_latent
+            del loaded_cond
+            del files_to_compress
 
     @staticmethod
     def _atomic_save(payload, filepath):
@@ -1498,7 +1544,7 @@ class LatentConditioningStorage:
 
         raise FileNotFoundError(f"[Storage Node] Could not locate file: {filename}")
 
-# --- Server Endpoint: Always streams a single compressed zip file ---
+# --- Native Stream Endpoint: Streams single zip directly to browser ---
 @PromptServer.instance.routes.get("/latcond/download")
 async def download_latcond_zip(request):
     latent_file = request.rel_url.query.get("latent_file", "").strip()
@@ -1515,12 +1561,14 @@ async def download_latcond_zip(request):
         return web.Response(status=404, text="No valid files selected to download.")
 
     bio = io.BytesIO()
-    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for full_path, arc_name in files_to_pack:
-            zf.write(full_path, arcname=arc_name)
+    try:
+        with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for full_path, arc_name in files_to_pack:
+                zf.write(full_path, arcname=arc_name)
 
-    zip_bytes = bio.getvalue()
-    bio.close()
+        zip_bytes = bio.getvalue()
+    finally:
+        bio.close()
 
     ts = int(time.time())
     zip_filename = f"latcond_{ts}.zip"
@@ -1530,6 +1578,7 @@ async def download_latcond_zip(request):
         content_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'}
     )
+
 # =====================================================================
 # 5. Restart Node
 # =====================================================================

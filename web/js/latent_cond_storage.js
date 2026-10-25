@@ -11,6 +11,9 @@ async function uploadAndAssignFile(node, file) {
     const data = await res.json();
     const uploadedName = data.name;
 
+    node._fileTypes = node._fileTypes || {};
+    node._fileTypes[uploadedName] = "input";
+
     const lowerName = uploadedName.toLowerCase();
     const latentWidget = node.widgets?.find(w => w.name === "latent_file");
     const condWidget = node.widgets?.find(w => w.name === "cond_file");
@@ -46,7 +49,7 @@ app.registerExtension({
 
         const fullDescription = [
             "Save and load Latent and Conditioning tensors.",
-            "• Save: Connect latent or conditioning to auto-save to disk.",
+            "• Pass-Through: Tensors pass downstream 100% untouched.",
             "• Upload: Drag and drop .pt or .zip files directly onto the node.",
             "• Download: Right-click node -> 'Download (Compressed Zip)'."
         ].join("\n");
@@ -54,13 +57,13 @@ app.registerExtension({
         node.tooltip = fullDescription;
         node.getTooltip = () => fullDescription;
 
-        // 1. Drag & Drop Support
+        // ComfyUI Native Drag & Drop Contract
         node.onDragOver = function (e) {
             if (e?.dataTransfer?.types?.includes("Files")) {
                 e.preventDefault();
                 e.stopPropagation();
                 e.dataTransfer.dropEffect = "copy";
-                app.dragOverNode = node;
+                app.dragOverNode = node; // Explicitly targets this node in ComfyUI app.ts
                 return true;
             }
             return false;
@@ -82,14 +85,14 @@ app.registerExtension({
                 }
                 node.setDirtyCanvas?.(true, true);
                 app.graph?.setDirtyCanvas(true, true);
-                return true;
+                return true; // Cancels ComfyUI's canvas workflow-loader
             } catch (err) {
                 alert(err.message);
                 return true;
             }
         };
 
-        // 2. Right-Click Context Menu: ALWAYS downloads a single compressed .zip
+        // ComfyUI Native Right-Click Context Menu Hook
         const origGetExtraMenuOptions = node.getExtraMenuOptions;
         node.getExtraMenuOptions = function (canvas, options) {
             origGetExtraMenuOptions?.apply(this, arguments);
@@ -101,7 +104,6 @@ app.registerExtension({
                 options.push({
                     content: "Download (Compressed Zip)",
                     callback: () => {
-                        // Requests single zip archive from backend - NO multi-file loop
                         const url = api.apiURL(
                             `/latcond/download?latent_file=${encodeURIComponent(latentFile)}&cond_file=${encodeURIComponent(condFile)}`
                         );
@@ -117,6 +119,7 @@ app.registerExtension({
     },
 
     setup() {
+        // Official executed event listener for UI updates
         api.addEventListener("executed", ({ detail }) => {
             const node = app.graph.getNodeById(detail?.node);
             if (!node) return;
