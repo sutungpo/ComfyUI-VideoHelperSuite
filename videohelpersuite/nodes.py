@@ -1682,9 +1682,9 @@ def _describe(obj, name, depth=0):
         summary, children = _inspect(obj)
     except Exception as exc:  # logging must never break the graph
         summary, children = f"type={type(obj).__name__} <inspect failed: {exc!r}>", []
-    log.info("[DataInspector] %s%s: %s", pad, name, summary)
+    logger.info("[DataInspector] %s%s: %s", pad, name, summary)
     if children and depth >= MAX_DEPTH:
-        log.info("[DataInspector] %s  ...<max depth %d reached>", pad, MAX_DEPTH)
+        logger.info("[DataInspector] %s  ...<max depth %d reached>", pad, MAX_DEPTH)
         return
     for child_name, child in children:
         _describe(child, child_name, depth + 1)
