@@ -1600,6 +1600,120 @@ class RestartSignal:
         logger.warning("[RestartSignal] Restart requested.")
         return {}
 
+# =====================================================================
+# 6. DataInspector log
+# =====================================================================
+"""Data Inspector: a pass-through node that logs details of whatever flows through it."""
+import logging
+from comfy_api.latest import io
+
+MAX_VALUE_ELEMS = 32  # larger values are not logged; also caps listed container items
+MAX_DEPTH = 2         # container levels expanded below the input
+
+_DEVICE_ATTRS = ("device", "load_device", "offload_device", "current_device")
+_WRAPPED_ATTRS = ("model", "patcher")  # one wrapper level, e.g. ModelPatcher.model, CLIP.patcher
+_SCALARS = (bool, int, float, complex, type(None))
+
+def _get(obj, name):
+    try:
+        return getattr(obj, name, None)
+    except Exception:
+        return None
+
+
+def _device_info(obj):
+    """Best-effort device details for objects that are not tensors or plain containers."""
+    info = []
+    targets = [("", obj)] + [(f"{n}.", _get(obj, n)) for n in _WRAPPED_ATTRS]
+    for prefix, target in targets:
+        if target is None:
+            continue
+        for attr in _DEVICE_ATTRS:
+            value = _get(target, attr)
+            if value is not None and not callable(value):
+                info.append(f"{prefix}{attr}={value}")
+        if isinstance(target, torch.nn.Module):
+            devices, params, size = set(), 0, 0
+            for p in target.parameters():
+                devices.add(str(p.device))
+                params += p.numel()
+                size += p.numel() * p.element_size()
+            info.append(f"{prefix}param_devices={sorted(devices)} params={params} param_bytes={size}")
+    return info
+
+
+def _inspect(obj):
+    """Return (one-line summary, [(child name, child), ...])."""
+    parts = [f"type={type(obj).__name__}"]
+    children = []
+    count = value = None  # count: number of elements; value: zero-arg callable
+
+    if isinstance(obj, torch.Tensor):
+        count = obj.numel()
+        parts += [f"shape={tuple(obj.shape)}", f"dtype={obj.dtype}", f"device={obj.device}",
+                  f"numel={count}", f"bytes={count * obj.element_size()}"]
+        value = lambda: obj.detach().cpu().tolist()
+    elif isinstance(obj, np.ndarray):
+        count = obj.size
+        parts += [f"shape={obj.shape}", f"dtype={obj.dtype}", f"numel={count}", f"bytes={obj.nbytes}"]
+        value = obj.tolist
+    elif isinstance(obj, (str, bytes)):
+        count = len(obj)
+        parts.append(f"len={count}")
+        value = lambda: obj
+    elif isinstance(obj, _SCALARS):
+        count, value = 1, lambda: obj
+    elif isinstance(obj, (dict, list, tuple)):
+        parts.append(f"len={len(obj)}")
+        if len(obj) > MAX_VALUE_ELEMS:
+            parts.append(f"showing_first={MAX_VALUE_ELEMS}")
+        items = obj.items() if isinstance(obj, dict) else enumerate(obj)
+        children = [(f"[{k!r}]", v) for k, v in itertools.islice(items, MAX_VALUE_ELEMS)]
+    else:
+        parts.append(f"sizeof={sys.getsizeof(obj)}")
+        parts += _device_info(obj)
+
+    if count is not None:
+        parts.append(f"value={value()!r}" if count <= MAX_VALUE_ELEMS
+                     else f"value=<omitted: {count} elements>")
+    return " ".join(parts), children
+
+
+def _describe(obj, name, depth=0):
+    pad = "  " * depth
+    try:
+        summary, children = _inspect(obj)
+    except Exception as exc:  # logging must never break the graph
+        summary, children = f"type={type(obj).__name__} <inspect failed: {exc!r}>", []
+    logger.info("[DataInspector] %s%s: %s", pad, name, summary)
+    if children and depth >= MAX_DEPTH:
+        logger.info("[DataInspector] %s  ...<max depth %d reached>", pad, MAX_DEPTH)
+        return
+    for child_name, child in children:
+        _describe(child, child_name, depth + 1)
+
+
+class DataInspector(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="DataInspector",
+            display_name="Data Inspector",
+            category="utils/debug",
+            is_output_node=True,
+            inputs=[io.AnyType.Input("data")],
+            outputs=[io.AnyType.Output("data")],
+        )
+
+    @classmethod
+    def validate_inputs(cls, input_types=None, **kwargs):
+        return True  # wildcard input: skip backend type validation
+
+    @classmethod
+    def execute(cls, data) -> io.NodeOutput:
+        _describe(data, "data")
+        return io.NodeOutput(data)
+
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,
@@ -1607,6 +1721,7 @@ NODE_CLASS_MAPPINGS = {
     "VHS_ImagePreviewRAM": VHS_ImagePreviewRAM,
     "VHS_LatentConditioningStorage": LatentConditioningStorage,
     "VHS_RestartSignal": RestartSignal,
+    "VHS_DataInspector": DataInspector,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadVideoFFmpeg": LoadVideoFFmpegUpload,
     "VHS_LoadVideoFFmpegPath": LoadVideoFFmpegPath,
@@ -1655,6 +1770,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_ImagePreviewRAM": "Image Preview (RAM) 🎥🅥🅗🅢",
     "VHS_LatentConditioningStorage": "Latent Conditioning Storage 🎥🅥🅗🅢",
     "VHS_RestartSignal": "Restart Signal 🎥🅥🅗🅢",
+    "VHS_DataInspector": "DataInspector log 🎥🅥🅗🅢",
     "VHS_LoadVideoPath": "Load Video (Path) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpeg": "Load Video FFmpeg (Upload) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpegPath": "Load Video FFmpeg (Path) 🎥🅥🅗🅢",
