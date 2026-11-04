@@ -1604,23 +1604,20 @@ class RestartSignal:
 # 6. DataInspector log
 # =====================================================================
 """Data Inspector: a pass-through node that logs details of whatever flows through it."""
-import logging
-from comfy_api.latest import io
-
 MAX_VALUE_ELEMS = 32  # larger values are not logged; also caps listed container items
 MAX_DEPTH = 2         # container levels expanded below the input
-
+ 
 _DEVICE_ATTRS = ("device", "load_device", "offload_device", "current_device")
 _WRAPPED_ATTRS = ("model", "patcher")  # one wrapper level, e.g. ModelPatcher.model, CLIP.patcher
 _SCALARS = (bool, int, float, complex, type(None))
-
+ 
 def _get(obj, name):
     try:
         return getattr(obj, name, None)
     except Exception:
         return None
-
-
+ 
+ 
 def _device_info(obj):
     """Best-effort device details for objects that are not tensors or plain containers."""
     info = []
@@ -1640,14 +1637,14 @@ def _device_info(obj):
                 size += p.numel() * p.element_size()
             info.append(f"{prefix}param_devices={sorted(devices)} params={params} param_bytes={size}")
     return info
-
-
+ 
+ 
 def _inspect(obj):
     """Return (one-line summary, [(child name, child), ...])."""
     parts = [f"type={type(obj).__name__}"]
     children = []
     count = value = None  # count: number of elements; value: zero-arg callable
-
+ 
     if isinstance(obj, torch.Tensor):
         count = obj.numel()
         parts += [f"shape={tuple(obj.shape)}", f"dtype={obj.dtype}", f"device={obj.device}",
@@ -1672,47 +1669,45 @@ def _inspect(obj):
     else:
         parts.append(f"sizeof={sys.getsizeof(obj)}")
         parts += _device_info(obj)
-
+ 
     if count is not None:
         parts.append(f"value={value()!r}" if count <= MAX_VALUE_ELEMS
                      else f"value=<omitted: {count} elements>")
     return " ".join(parts), children
-
-
+ 
+ 
 def _describe(obj, name, depth=0):
     pad = "  " * depth
     try:
         summary, children = _inspect(obj)
     except Exception as exc:  # logging must never break the graph
         summary, children = f"type={type(obj).__name__} <inspect failed: {exc!r}>", []
-    logger.info("[DataInspector] %s%s: %s", pad, name, summary)
+    log.info("[DataInspector] %s%s: %s", pad, name, summary)
     if children and depth >= MAX_DEPTH:
-        logger.info("[DataInspector] %s  ...<max depth %d reached>", pad, MAX_DEPTH)
+        log.info("[DataInspector] %s  ...<max depth %d reached>", pad, MAX_DEPTH)
         return
     for child_name, child in children:
         _describe(child, child_name, depth + 1)
-
-
-class DataInspector(io.ComfyNode):
+ 
+ 
+class DataInspector:
+    CATEGORY = "utils/debug"
+    FUNCTION = "inspect"
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("data",)
+    OUTPUT_NODE = True
+ 
     @classmethod
-    def define_schema(cls) -> io.Schema:
-        return io.Schema(
-            node_id="DataInspector",
-            display_name="Data Inspector",
-            category="utils/debug",
-            is_output_node=True,
-            inputs=[io.AnyType.Input("data")],
-            outputs=[io.AnyType.Output("data")],
-        )
-
+    def INPUT_TYPES(cls):
+        return {"required": {"data": ("*", {})}}
+ 
     @classmethod
-    def validate_inputs(cls, input_types=None, **kwargs):
+    def VALIDATE_INPUTS(cls, input_types):
         return True  # wildcard input: skip backend type validation
-
-    @classmethod
-    def execute(cls, data) -> io.NodeOutput:
+ 
+    def inspect(self, data):
         _describe(data, "data")
-        return io.NodeOutput(data)
+        return (data,)
 
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
