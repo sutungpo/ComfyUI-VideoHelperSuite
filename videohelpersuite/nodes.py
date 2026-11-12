@@ -1709,6 +1709,133 @@ class DataInspector:
         _describe(data, "data")
         return (data,)
 
+# =====================================================================
+# 7. Model Downloader
+# =====================================================================
+import shutil
+import comfy.utils
+
+class ModelDownloaderNode:
+    """
+    High-speed model downloader for ComfyUI leveraging aria2c.
+    Supports Hugging Face, Civitai, and direct model CDNs with 16 parallel TCP streams.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        available_categories = sorted(list(folder_paths.folder_names_and_paths.keys()))
+        default_category = "checkpoints" if "checkpoints" in available_categories else available_categories[0]
+
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": False}),
+                "target_category": (available_categories, {"default": default_category}),
+                "overwrite": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "subfolder": ("STRING", {"default": "", "multiline": False}),
+                "filename": ("STRING", {"default": "", "multiline": False}),
+                "auth_token": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "execute"
+    OUTPUT_NODE = True
+    CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
+
+    def execute(self, url: str, target_category: str, overwrite: bool, subfolder: str = "", filename: str = "", auth_token: str = ""):
+        url = url.strip()
+        if not url:
+            logger.info("[ModelDownloader] Empty URL provided. Skipping.")
+            return ()
+
+        # 1. Platform Binary Verification
+        if not shutil.which("aria2c"):
+            raise RuntimeError(
+                "[ModelDownloader] 'aria2c' binary not found in system PATH. "
+                "Please install it in your cloud container (e.g., 'apt-get update && apt-get install -y aria2')."
+            )
+
+        # 2. Strict ComfyUI Path Resolution & Traversal Guard
+        base_dirs = folder_paths.get_folder_paths(target_category)
+        if not base_dirs:
+            raise ValueError(f"[ModelDownloader] No paths registered for category '{target_category}'")
+
+        base_dir = os.path.abspath(base_dirs[0])
+        clean_subfolder = subfolder.strip().lstrip("/\\")
+        target_dir = os.path.abspath(os.path.join(base_dir, clean_subfolder))
+
+        if os.path.commonpath([base_dir, target_dir]) != base_dir:
+            raise ValueError(f"[ModelDownloader] Security violation: Destination '{target_dir}' escapes '{base_dir}'")
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        # Skip execution if target filename is known and already exists
+        target_filename = filename.strip()
+        if target_filename:
+            destination_file = os.path.join(target_dir, target_filename)
+            if os.path.exists(destination_file) and not overwrite:
+                logger.info(f"[ModelDownloader] File already exists, skipping: {destination_file}")
+                return ()
+
+        # 3. Target URL & Auth Normalization (Hugging Face / Civitai)
+        if "huggingface.co" in url:
+            url = url.replace("/blob/", "/resolve/")
+
+        cmd = [
+            "aria2c",
+            "--console-log-level=warn",
+            "--summary-interval=1",
+            "-x", "16",             # 16 connections per server
+            "-s", "16",             # Split file into 16 parts
+            "-k", "1M",             # 1MB minimum chunk size
+            "-c",                   # Resumable download
+            f"--dir={target_dir}",
+        ]
+
+        if target_filename:
+            cmd.append(f"--out={target_filename}")
+
+        if overwrite:
+            cmd.append("--allow-overwrite=true")
+        else:
+            cmd.append("--auto-file-renaming=false")
+
+        token = auth_token.strip()
+        if token:
+            cmd.append(f"--header=Authorization: Bearer {token}")
+
+        cmd.append(url)
+
+        # 4. Process Execution & Native ComfyUI Progress Hook
+        logger.info(f"[ModelDownloader] Initiating transfer for: {url}")
+        pbar = comfy.utils.ProgressBar(100)
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        progress_regex = re.compile(r'\((\s*\d+)%\)')
+
+        for line in process.stdout:
+            match = progress_regex.search(line)
+            if match:
+                percent = int(match.group(1))
+                pbar.update_absolute(percent, 100)
+
+        process.wait()
+
+        if process.returncode != 0:
+            raise RuntimeError(f"[ModelDownloader] aria2c transfer failed with exit code {process.returncode}")
+
+        pbar.update_absolute(100, 100)
+        logger.info(f"[ModelDownloader] Download completed successfully to {target_dir}")
+        return ()
+
 NODE_CLASS_MAPPINGS = {
     "VHS_VideoCombine": VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,
@@ -1717,6 +1844,7 @@ NODE_CLASS_MAPPINGS = {
     "VHS_LatentConditioningStorage": LatentConditioningStorage,
     "VHS_RestartSignal": RestartSignal,
     "VHS_DataInspector": DataInspector,
+    "ModelDownloaderNode": ModelDownloaderNode,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadVideoFFmpeg": LoadVideoFFmpegUpload,
     "VHS_LoadVideoFFmpegPath": LoadVideoFFmpegPath,
@@ -1766,6 +1894,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VHS_LatentConditioningStorage": "Latent Conditioning Storage 🎥🅥🅗🅢",
     "VHS_RestartSignal": "Restart Signal 🎥🅥🅗🅢",
     "VHS_DataInspector": "DataInspector log 🎥🅥🅗🅢",
+    "ModelDownloaderNode": "Model Downloader 🎥🅥🅗🅢",
     "VHS_LoadVideoPath": "Load Video (Path) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpeg": "Load Video FFmpeg (Upload) 🎥🅥🅗🅢",
     "VHS_LoadVideoFFmpegPath": "Load Video FFmpeg (Path) 🎥🅥🅗🅢",
