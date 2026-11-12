@@ -1723,12 +1723,14 @@ import comfy.utils
 class ModelDownloaderNode:
     """
     High-speed model downloader for ComfyUI leveraging aria2c.
-    Handles Hugging Face redirection, subfolder auto-creation, and ComfyUI cache invalidation.
+    Supports existing categories or creating new first-level directories in ComfyUI/models/.
     """
     @classmethod
     def INPUT_TYPES(s):
-        available_categories = sorted(list(folder_paths.folder_names_and_paths.keys()))
-        default_category = "checkpoints" if "checkpoints" in available_categories else available_categories[0]
+        # Query ComfyUI's registry and add [models_root] to allow 1st-level folder creation
+        registered_categories = sorted(list(folder_paths.folder_names_and_paths.keys()))
+        available_categories = ["[models_root]"] + registered_categories
+        default_category = "checkpoints" if "checkpoints" in registered_categories else "[models_root]"
 
         return {
             "required": {
@@ -1751,7 +1753,7 @@ class ModelDownloaderNode:
     def execute(self, url: str, target_category: str, overwrite: bool, subfolder: str = "", filename: str = "", auth_token: str = ""):
         url = url.strip()
         if not url:
-            logger.info("[ModelDownloader] Empty URL provided. Skipping.")
+            print("[ModelDownloader] Empty URL provided. Skipping.")
             return ()
 
         # 1. Platform Binary Verification
@@ -1761,14 +1763,18 @@ class ModelDownloaderNode:
                 "Please install it in your cloud container (e.g., 'apt-get update && apt-get install -y aria2')."
             )
 
-        # 2. Strict ComfyUI Path Resolution & Nested Subfolder Creation
-        base_dirs = folder_paths.get_folder_paths(target_category)
-        if not base_dirs:
-            raise ValueError(f"[ModelDownloader] No paths registered for category '{target_category}'")
+        # 2. Strict ComfyUI Path Resolution
+        if target_category == "[models_root]":
+            # Target ComfyUI/models/ directly
+            base_dir = os.path.abspath(folder_paths.models_dir)
+        else:
+            base_dirs = folder_paths.get_folder_paths(target_category)
+            if not base_dirs:
+                raise ValueError(f"[ModelDownloader] No paths registered for category '{target_category}'")
+            base_dir = os.path.abspath(base_dirs[0])
 
-        base_dir = os.path.abspath(base_dirs[0])
         clean_subfolder = os.path.normpath(subfolder.strip()).lstrip("/\\")
-        
+
         if clean_subfolder in ("", "."):
             target_dir = base_dir
         else:
@@ -1778,11 +1784,14 @@ class ModelDownloaderNode:
         if os.path.commonpath([base_dir, target_dir]) != base_dir:
             raise ValueError(f"[ModelDownloader] Security violation: Destination '{target_dir}' escapes '{base_dir}'")
 
-        # Automatically create single or deeply nested subfolders
+        # Automatically create the first-level or nested subfolder
         os.makedirs(target_dir, exist_ok=True)
 
+        # If a new first-level directory is created under models/, register it with ComfyUI
+        if target_category == "[models_root]" and clean_subfolder and hasattr(folder_paths, "add_model_folder_path"):
+            folder_paths.add_model_folder_path(clean_subfolder, target_dir)
+
         # 3. Filename & Source URL Normalization
-        # Rewrite Hugging Face Web UI /blob/ routes to direct /resolve/ endpoints
         if "huggingface.co" in url:
             url = url.replace("/blob/", "/resolve/")
 
@@ -1791,7 +1800,6 @@ class ModelDownloaderNode:
         if not target_filename:
             parsed_path = urllib.parse.urlsplit(url).path.rstrip("/")
             extracted_name = os.path.basename(parsed_path)
-            # Ensure it is a valid filename with an extension, not an empty string or raw domain
             if extracted_name and "." in extracted_name:
                 target_filename = urllib.parse.unquote(extracted_name)
 
@@ -1799,8 +1807,7 @@ class ModelDownloaderNode:
         if target_filename:
             destination_file = os.path.join(target_dir, target_filename)
             if os.path.exists(destination_file) and not overwrite:
-                logger.info(f"[ModelDownloader] File already exists, skipping: {destination_file}")
-                # Refresh cache anyway in case file was placed manually
+                print(f"[ModelDownloader] File already exists, skipping: {destination_file}")
                 if hasattr(folder_paths, "filename_list_cache"):
                     folder_paths.filename_list_cache.clear()
                 return ()
@@ -1810,11 +1817,11 @@ class ModelDownloaderNode:
             "aria2c",
             "--console-log-level=warn",
             "--summary-interval=1",
-            "--content-disposition=true",  # Parses real filename if redirected to CDN hash
-            "-x", "16",                    # 16 connections per server
-            "-s", "16",                    # Split into 16 chunks
+            "--content-disposition=true",
+            "-x", "16",
+            "-s", "16",
             "-k", "1M",
-            "-c",                          # Resume capability
+            "-c",
             f"--dir={target_dir}",
         ]
 
@@ -1833,7 +1840,7 @@ class ModelDownloaderNode:
         cmd.append(url)
 
         # 5. Process Execution & Progress Reporting via Native ComfyUI Contract
-        logger.info(f"[ModelDownloader] Initiating transfer for: {url}")
+        print(f"[ModelDownloader] Initiating transfer for: {url}")
         pbar = comfy.utils.ProgressBar(100)
 
         process = subprocess.Popen(
@@ -1859,12 +1866,11 @@ class ModelDownloaderNode:
 
         pbar.update_absolute(100, 100)
 
-        # 6. Invalidate ComfyUI Path Cache (Design by Contract)
-        # Forces ComfyUI's backend to rescan directories so subsequent loaders immediately see the file
+        # 6. Invalidate ComfyUI Cache
         if hasattr(folder_paths, "filename_list_cache"):
             folder_paths.filename_list_cache.clear()
 
-        logger.info(f"[ModelDownloader] Download completed successfully to {target_dir}")
+        print(f"[ModelDownloader] Download completed successfully to {target_dir}")
         return ()
 
 NODE_CLASS_MAPPINGS = {
