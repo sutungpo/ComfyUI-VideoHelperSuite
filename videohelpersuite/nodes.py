@@ -1713,12 +1713,8 @@ class DataInspector:
 # 7. Model Downloader
 # =====================================================================
 import shutil
-import comfy.utils
-
 import urllib.parse
-import folder_paths
 import comfy.utils
-
 
 class ModelDownloaderNode:
     """
@@ -1753,7 +1749,7 @@ class ModelDownloaderNode:
     def execute(self, url: str, target_category: str, overwrite: bool, subfolder: str = "", filename: str = "", auth_token: str = ""):
         url = url.strip()
         if not url:
-            print("[ModelDownloader] Empty URL provided. Skipping.")
+            logger.info("[ModelDownloader] Empty URL provided. Skipping.")
             return ()
 
         # 1. Platform Binary Verification
@@ -1807,7 +1803,7 @@ class ModelDownloaderNode:
         if target_filename:
             destination_file = os.path.join(target_dir, target_filename)
             if os.path.exists(destination_file) and not overwrite:
-                print(f"[ModelDownloader] File already exists, skipping: {destination_file}")
+                logger.info(f"[ModelDownloader] File already exists, skipping: {destination_file}")
                 if hasattr(folder_paths, "filename_list_cache"):
                     folder_paths.filename_list_cache.clear()
                 return ()
@@ -1840,7 +1836,7 @@ class ModelDownloaderNode:
         cmd.append(url)
 
         # 5. Process Execution & Progress Reporting via Native ComfyUI Contract
-        print(f"[ModelDownloader] Initiating transfer for: {url}")
+        logger.info(f"[ModelDownloader] Initiating transfer for: {url}")
         pbar = comfy.utils.ProgressBar(100)
 
         process = subprocess.Popen(
@@ -1870,7 +1866,7 @@ class ModelDownloaderNode:
         if hasattr(folder_paths, "filename_list_cache"):
             folder_paths.filename_list_cache.clear()
 
-        print(f"[ModelDownloader] Download completed successfully to {target_dir}")
+        logger.info(f"[ModelDownloader] Download completed successfully to {target_dir}")
         return ()
 
 NODE_CLASS_MAPPINGS = {
