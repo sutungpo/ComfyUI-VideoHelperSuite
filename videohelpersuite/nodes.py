@@ -1715,10 +1715,15 @@ class DataInspector:
 import shutil
 import comfy.utils
 
+import urllib.parse
+import folder_paths
+import comfy.utils
+
+
 class ModelDownloaderNode:
     """
     High-speed model downloader for ComfyUI leveraging aria2c.
-    Supports Hugging Face, Civitai, and direct model CDNs with 16 parallel TCP streams.
+    Handles Hugging Face redirection, subfolder auto-creation, and ComfyUI cache invalidation.
     """
     @classmethod
     def INPUT_TYPES(s):
@@ -1756,40 +1761,60 @@ class ModelDownloaderNode:
                 "Please install it in your cloud container (e.g., 'apt-get update && apt-get install -y aria2')."
             )
 
-        # 2. Strict ComfyUI Path Resolution & Traversal Guard
+        # 2. Strict ComfyUI Path Resolution & Nested Subfolder Creation
         base_dirs = folder_paths.get_folder_paths(target_category)
         if not base_dirs:
             raise ValueError(f"[ModelDownloader] No paths registered for category '{target_category}'")
 
         base_dir = os.path.abspath(base_dirs[0])
-        clean_subfolder = subfolder.strip().lstrip("/\\")
-        target_dir = os.path.abspath(os.path.join(base_dir, clean_subfolder))
+        clean_subfolder = os.path.normpath(subfolder.strip()).lstrip("/\\")
+        
+        if clean_subfolder in ("", "."):
+            target_dir = base_dir
+        else:
+            target_dir = os.path.abspath(os.path.join(base_dir, clean_subfolder))
 
+        # Enforce canonical path containment (prevent directory traversal)
         if os.path.commonpath([base_dir, target_dir]) != base_dir:
             raise ValueError(f"[ModelDownloader] Security violation: Destination '{target_dir}' escapes '{base_dir}'")
 
+        # Automatically create single or deeply nested subfolders
         os.makedirs(target_dir, exist_ok=True)
 
-        # Skip execution if target filename is known and already exists
+        # 3. Filename & Source URL Normalization
+        # Rewrite Hugging Face Web UI /blob/ routes to direct /resolve/ endpoints
+        if "huggingface.co" in url:
+            url = url.replace("/blob/", "/resolve/")
+
+        # Incur filename: User Override -> URL Path Basename -> Fallback to Content-Disposition
         target_filename = filename.strip()
+        if not target_filename:
+            parsed_path = urllib.parse.urlsplit(url).path.rstrip("/")
+            extracted_name = os.path.basename(parsed_path)
+            # Ensure it is a valid filename with an extension, not an empty string or raw domain
+            if extracted_name and "." in extracted_name:
+                target_filename = urllib.parse.unquote(extracted_name)
+
+        # Skip download if the final target file already exists
         if target_filename:
             destination_file = os.path.join(target_dir, target_filename)
             if os.path.exists(destination_file) and not overwrite:
                 logger.info(f"[ModelDownloader] File already exists, skipping: {destination_file}")
+                # Refresh cache anyway in case file was placed manually
+                if hasattr(folder_paths, "filename_list_cache"):
+                    folder_paths.filename_list_cache.clear()
                 return ()
 
-        # 3. Target URL & Auth Normalization (Hugging Face / Civitai)
-        if "huggingface.co" in url:
-            url = url.replace("/blob/", "/resolve/")
-
+        # 4. Assemble aria2c Command
         cmd = [
             "aria2c",
             "--console-log-level=warn",
             "--summary-interval=1",
-            "-x", "16",             # 16 connections per server
-            "-s", "16",             # Split file into 16 parts
-            "-k", "1M",             # 1MB minimum chunk size
-            "-c",                   # Resumable download
+            "--content-disposition=true",  # Parses real filename if redirected to CDN hash
+            "-x", "16",                    # 16 connections per server
+            "-s", "16",                    # Split into 16 chunks
+            "-k", "1M",
+            "-c",                          # Resume capability
             f"--dir={target_dir}",
         ]
 
@@ -1807,7 +1832,7 @@ class ModelDownloaderNode:
 
         cmd.append(url)
 
-        # 4. Process Execution & Native ComfyUI Progress Hook
+        # 5. Process Execution & Progress Reporting via Native ComfyUI Contract
         logger.info(f"[ModelDownloader] Initiating transfer for: {url}")
         pbar = comfy.utils.ProgressBar(100)
 
@@ -1833,6 +1858,12 @@ class ModelDownloaderNode:
             raise RuntimeError(f"[ModelDownloader] aria2c transfer failed with exit code {process.returncode}")
 
         pbar.update_absolute(100, 100)
+
+        # 6. Invalidate ComfyUI Path Cache (Design by Contract)
+        # Forces ComfyUI's backend to rescan directories so subsequent loaders immediately see the file
+        if hasattr(folder_paths, "filename_list_cache"):
+            folder_paths.filename_list_cache.clear()
+
         logger.info(f"[ModelDownloader] Download completed successfully to {target_dir}")
         return ()
 
